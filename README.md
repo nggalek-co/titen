@@ -1,8 +1,8 @@
 # Titen
 
-Titen is a macOS meeting transcription application built with MyGo native GPU widgets, Go, and a Swift ScreenCaptureKit helper. It captures microphone and playback audio, streams mixed speech to Soniox, saves finalized transcripts in SQLite, and synchronizes them to Google Docs.
+Titen is a native desktop meeting transcription application for macOS and Windows built with MyGo native GPU widgets, Go, and a Swift ScreenCaptureKit helper. It captures microphone and playback audio, streams mixed speech to Soniox, saves finalized transcripts in SQLite, and synchronizes them to Google Docs.
 
-The macOS application builds locally. Automated tests pass. Live capture and provider acceptance remain unverified in this environment. Read [verification results](docs/verification.md) before relying on it for a meeting.
+The macOS application builds locally. Windows builds and tests run on GitHub-hosted Windows runners. Live capture and provider acceptance remain unverified in this environment. Read [verification results](docs/verification.md) before relying on it for a meeting.
 
 ## Build and run
 
@@ -17,6 +17,40 @@ The script builds the Swift helper and Go application, creates the app bundle, a
 
 For development, build the helper first with the build script, then run `go run .` from the project root. The app locates the release helper under native/macos/.build/release when it is not beside the Go executable. The packaged app gives macOS a stable bundle identity for permission checks.
 
+## Windows builds
+
+Windows 10 and later on x64 are the initial Windows target. Build with Go 1.27.1 or later, CMake, and Visual Studio 2022 or later with the Desktop development with C++ workload and Windows SDK.
+
+```powershell
+./scripts/build-windows.ps1
+```
+
+Run `build/windows/Titen/Titen.exe`. Keep `titen-audio.exe` beside it. The package uses WASAPI microphone and playback loopback capture and Windows Credential Manager. No WebView2, external SQLite DLL, or virtual audio driver is required by this build.
+
+The native helper has a hardware-free protocol and conversion test.
+
+```powershell
+./build/windows-audio/Release/titen-audio.exe --self-test
+```
+
+The first supported release targets macOS ARM64, macOS Intel, and Windows AMD64. Linux and Windows ARM64 capture are not included. Physical Windows capture remains a separate acceptance test from compilation and protocol tests.
+
+## GitHub builds on version tags
+
+The Desktop builds workflow runs native tests and creates archives on pull requests, pushes to main, manual dispatch, and pushed tags matching `v*`. For example, pushing `v1.2.3` builds that exact tagged source.
+
+Each successful run uploads three downloadable GitHub Actions artifacts. Each artifact contains its platform ZIP and SHA256 checksum.
+
+- `Titen-macos-arm64` contains the Apple silicon app and Swift helper.
+- `Titen-macos-amd64` contains the Intel app and Swift helper.
+- `Titen-windows-amd64` contains the Windows application and WASAPI helper.
+
+Download them from the workflow run's Artifacts section. Version tags set the embedded application version and archive filenames. The workflow does not create tags or publish GitHub Releases. A failed platform build fails its job and produces no successful package for that platform.
+
+macOS packages are ad hoc signed for local testing. Windows packages are unsigned. Developer ID signing, notarization, and Windows signing require separate distribution configuration. Do not treat a downloadable archive as trusted production distribution.
+
+See [cross-platform architecture and verification](docs/cross-platform/README.md).
+
 ## Configure transcription and Google Docs
 
 1. Open **Settings** and enter your Soniox API key.
@@ -25,7 +59,7 @@ For development, build the helper first with the build script, then run `go run 
 4. Click **Connect Google** and complete authorization in your system browser.
 5. Return to **Record**, enter a meeting title, and click **Start recording**.
 
-Keys, OAuth client secrets, access tokens, and refresh tokens use macOS Keychain. The client ID and audio preferences are ordinary local settings. `GOOGLE_CLIENT_SECRET` optionally overrides the saved OAuth client secret for development. Environment variables set in a terminal do not automatically reach an app launched from Finder.
+Keys, OAuth client secrets, access tokens, and refresh tokens use macOS Keychain or Windows Credential Manager. The client ID and audio preferences are ordinary local settings. `GOOGLE_CLIENT_SECRET` optionally overrides the saved OAuth client secret for development. Environment variables set in a terminal do not automatically reach an app launched from Finder.
 
 OAuth requests the [drive.file scope recommended by Google](https://developers.google.com/workspace/docs/api/auth). An optional existing document ID must refer to a document already authorized for this app. Pasting an arbitrary document ID does not grant access. A Drive picker is not included. Leave the ID empty to create a new document automatically.
 
@@ -49,7 +83,7 @@ Use headphones to reduce playback leakage into the microphone. Titen does not pr
 
 Open **History**, search meeting titles or transcript text, and select a meeting. Use **Copy transcript** or **Open Google Doc**. If automatic document creation is disabled, you can attach an app-authorized document ID later.
 
-Data lives in `~/Library/Application Support/Titen/`. SQLite contains meetings, speaker and timestamp metadata, finalized segments, and the durable synchronization outbox. The settings file contains preferences. Back up the whole directory while Titen is stopped if you need a consistent manual copy. Keychain credentials are separate from that directory.
+Data lives in `~/Library/Application Support/Titen/` on macOS and `%AppData%\Titen\` on Windows. SQLite contains meetings, speaker and timestamp metadata, finalized segments, and the durable synchronization outbox. The settings file contains preferences. Back up the whole directory while Titen is stopped if you need a consistent manual copy. Keychain credentials are separate from that directory.
 
 ## Understand recovery limits
 
