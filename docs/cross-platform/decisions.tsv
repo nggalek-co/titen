@@ -1,0 +1,13 @@
+ts	phase	decision	why	evidence	result
+2026-10-20T22:48:17+00:00	design	Keep native helpers and use one TIT1 protocol	Preserve native isolation and shared Go processing	docs/cross-platform/plan.md	contracts agreed
+2026-10-20T22:54:39+00:00	storage	Use modernc SQLite and bound parameters	Remove target linker dependencies while preserving files	internal/storage/sqlite_test.go	legacy SQLite and race tests passed
+2026-10-20T22:54:39+00:00	credentials	Add native Windows Credential Manager	Keep provider secrets out of plaintext files	internal/auth/keychain_windows_test.go	Windows compile passed; native roundtrip awaits CI
+2026-10-20T22:54:39+00:00	lifecycle	Use stdin stop and portable Go fixtures	Unix signals and shell scripts cannot validate Windows behavior	internal/audio/capture_test.go; internal/testhelper	local race and Windows compile passed
+2026-10-20T22:54:39+00:00	windows	Add WASAPI native capture helper	Preserve independent microphone and loopback sources	native/windows/capture.cpp; native/windows/pcm.hpp	portable self-test passed; Windows native compile awaits CI
+2026-10-20T22:54:39+00:00	review	Replace raced cancellation with interruptible stdin polling	CancelSynchronousIo cannot cancel a future read	native/windows/capture.cpp	review finding fixed; native CI pending
+2026-10-20T22:54:39+00:00	review	Hide Windows helper console windows	Background capture must not open a console	internal/audio/process_windows.go	Windows compile gate pending
+2026-10-20T22:54:39+00:00	packaging	Build and inspect packaged app plus helper	A staging directory is not proof of archive contents	cmd/packagecheck; scripts/build-macos.sh	local macOS archive and checksum verified
+2026-10-20T22:54:39+00:00	ci	Build native macOS ARM64 and Intel plus Windows AMD64 on v tags	Each platform needs its own compiler and runtime tests	.github/workflows/desktop.yml	actionlint passed; native runs pending
+2026-10-20T22:56:49+00:00	publication	Push the feature branch through the existing SSH identity	HTTPS token cannot push workflows without extra scope	https://github.com/nggalek-co/titen/pull/1	PR opened; native CI running
+2026-10-20T23:00:02+00:00	ci-fix	Use Windows delete-on-close for the audio spool	Native Windows tests proved POSIX unlink is not portable	internal/transcription/spoolfile_windows.go; https://github.com/nggalek-co/titen/actions/runs/39511605664	local race and Windows compilation passed; native rerun pending
+2026-10-20T23:10:00+00:00	verification	Accept native matrix after fixing Windows spool ownership	Compilation alone missed Windows file semantics	https://github.com/nggalek-co/titen/actions/runs/39512151176	all three native jobs passed; downloaded archives and checksums verified

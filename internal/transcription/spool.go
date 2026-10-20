@@ -3,17 +3,12 @@ package transcription
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 )
 
 func spool(ctx context.Context, audio <-chan []byte, failed func(error)) (<-chan []byte, func(), error) {
-	file, err := os.CreateTemp("", "titen-audio-*")
+	file, err := createSpoolFile()
 	if err != nil {
-		return nil, nil, err
-	}
-	if err = os.Remove(file.Name()); err != nil {
-		file.Close()
 		return nil, nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -94,5 +95,77 @@ func TestSegmentBatchRollback(t *testing.T) {
 	rows, e := s.Segments(ctx, m.ID)
 	if e != nil || len(rows) != 0 {
 		t.Fatalf("partial commit %v %v", rows, e)
+	}
+}
+
+func TestBoundValuesRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	value := "'quoted'; DROP TABLE meetings;\x00日本語"
+	if err := s.SetSetting(ctx, value, value); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSetting(ctx, value)
+	if err != nil || got != value {
+		t.Fatalf("setting=%q error=%v", got, err)
+	}
+	m, err := s.CreateMeeting(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetDocument(ctx, m.ID, "doc"); err != nil {
+		t.Fatal(err)
+	}
+	seg := transcript.Segment{MeetingID: m.ID, Text: value, StartMS: 9007199254740993, EndMS: 9007199254741000}
+	if err := s.AddSegments(ctx, []transcript.Segment{seg}); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := s.Segments(ctx, m.ID)
+	if err != nil || len(segments) != 1 || segments[0].Text != value || segments[0].StartMS != seg.StartMS {
+		t.Fatalf("segments=%v error=%v", segments, err)
+	}
+	ops, err := s.Pending(ctx)
+	if err != nil || len(ops) != 1 || ops[0].Text != value {
+		t.Fatalf("outbox=%v error=%v", ops, err)
+	}
+}
+
+func TestExistingNativeSQLiteDatabase(t *testing.T) {
+	data, err := os.ReadFile("testdata/legacy.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "existing.sqlite")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	meetings, err := s.Meetings(ctx, "")
+	if err != nil || len(meetings) != 1 || meetings[0].ID != "legacy-meeting" {
+		t.Fatalf("meetings=%v error=%v", meetings, err)
+	}
+	segments, err := s.Segments(ctx, "legacy-meeting")
+	if err != nil || len(segments) != 1 || segments[0].StartMS != 9007199254740993 {
+		t.Fatalf("segments=%v error=%v", segments, err)
+	}
+	ops, err := s.Pending(ctx)
+	if err != nil || len(ops) != 1 || ops[0].ID != "legacy-segment" || ops[0].Attempts != 3 || ops[0].DocumentID != "legacy-doc" {
+		t.Fatalf("outbox=%v error=%v", ops, err)
+	}
+	device, err := s.GetSetting(ctx, "audio-device")
+	if err != nil || device != "Existing microphone" {
+		t.Fatalf("setting=%q error=%v", device, err)
+	}
+	if err := s.Ack(ctx, "legacy-segment"); err != nil {
+		t.Fatal(err)
 	}
 }

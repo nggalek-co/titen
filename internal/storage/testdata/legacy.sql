@@ -1,0 +1,10 @@
+BEGIN TRANSACTION;
+CREATE TABLE meetings(id TEXT PRIMARY KEY,data TEXT NOT NULL);
+INSERT INTO "meetings" VALUES('legacy-meeting','{"id": "legacy-meeting", "title": "Existing meeting", "createdAt": "2026-10-20T00:00:00Z", "documentId": "legacy-doc"}');
+CREATE TABLE outbox(id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL,text TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0);
+INSERT INTO "outbox" VALUES('legacy-segment','legacy-meeting','Existing transcript',3,0);
+CREATE TABLE segments(id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL,data TEXT NOT NULL,start_ms INTEGER NOT NULL);
+INSERT INTO "segments" VALUES('legacy-segment','legacy-meeting','{"id": "legacy-segment", "meetingId": "legacy-meeting", "text": "Existing transcript", "startMs": 9007199254740993, "endMs": 9007199254741000}',9007199254740993);
+CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+INSERT INTO "settings" VALUES('audio-device','Existing microphone');
+COMMIT;

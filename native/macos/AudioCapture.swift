@@ -199,6 +199,10 @@ final class StopGate: @unchecked Sendable {
                 guard gate.begin() else { return }
                 Task { await capture.stop(); exit(0) }
             }
+            DispatchQueue.global().async {
+                _ = readLine()
+                stop()
+            }
             terminate.setEventHandler(handler: stop)
             interrupt.setEventHandler(handler: stop)
             terminate.resume()
