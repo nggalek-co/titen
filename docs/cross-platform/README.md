@@ -14,6 +14,8 @@ This change ports the existing recorder to macOS and Windows. It does not implem
 | Native capture IPC | TIT1 signed PCM16 frames over binary stdout; stdin newline or EOF requests stop. |
 | Packaging | Native macOS app bundle and Windows directory package, each containing its capture helper. |
 
+The temporary audio spool uses POSIX unlink on macOS and an exclusively opened delete-on-close handle on Windows. Both paths remove temporary audio when the process releases its handle.
+
 Both native helpers retain source identity. Windows emits native-rate mono PCM16 and the shared pipeline resamples it. Device enumeration returns stable native endpoint IDs with display names.
 
 The portable Go helper test fixture replaces shell scripts. Windows runs capture lifecycle, microphone-meter, SQLite, cloud mock, and native UI tester tests without skipping them for lack of a Unix shell. A Windows-only credential test writes and deletes a uniquely named dummy credential on the ephemeral CI runner when TITEN_TEST_CREDENTIALS=1.

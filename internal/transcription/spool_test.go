@@ -3,6 +3,7 @@ package transcription
 import (
 	"bytes"
 	"context"
+	"os"
 	"testing"
 )
 
@@ -23,5 +24,27 @@ func TestAudioSpoolPreservesOrder(t *testing.T) {
 	}
 	if got.String() != "onetwothree" {
 		t.Fatalf("got %q", got.String())
+	}
+}
+
+func TestSpoolFileDeletedOnClose(t *testing.T) {
+	file, err := createSpoolFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := file.Name()
+	defer file.Close()
+	if _, err = file.WriteAt([]byte("test"), 0); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 4)
+	if _, err = file.ReadAt(data, 0); err != nil || string(data) != "test" {
+		t.Fatalf("spool IO %q %v", data, err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(name); !os.IsNotExist(err) {
+		t.Fatalf("spool file survived close: %v", err)
 	}
 }

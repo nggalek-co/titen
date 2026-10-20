@@ -8,3 +8,5 @@ ts	phase	decision	why	evidence	result
 2026-10-20T22:54:39+00:00	review	Hide Windows helper console windows	Background capture must not open a console	internal/audio/process_windows.go	Windows compile gate pending
 2026-10-20T22:54:39+00:00	packaging	Build and inspect packaged app plus helper	A staging directory is not proof of archive contents	cmd/packagecheck; scripts/build-macos.sh	local macOS archive and checksum verified
 2026-10-20T22:54:39+00:00	ci	Build native macOS ARM64 and Intel plus Windows AMD64 on v tags	Each platform needs its own compiler and runtime tests	.github/workflows/desktop.yml	actionlint passed; native runs pending
+2026-10-20T22:56:49+00:00	publication	Push the feature branch through the existing SSH identity	HTTPS token cannot push workflows without extra scope	https://github.com/nggalek-co/titen/pull/1	PR opened; native CI running
+2026-10-20T23:00:02+00:00	ci-fix	Use Windows delete-on-close for the audio spool	Native Windows tests proved POSIX unlink is not portable	internal/transcription/spoolfile_windows.go; https://github.com/nggalek-co/titen/actions/runs/39511605664	local race and Windows compilation passed; native rerun pending

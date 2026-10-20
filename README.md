@@ -1,10 +1,10 @@
 # Titen
 
-Titen is a native desktop meeting transcription application for macOS and Windows built with MyGo native GPU widgets, Go, and a Swift ScreenCaptureKit helper. It captures microphone and playback audio, streams mixed speech to Soniox, saves finalized transcripts in SQLite, and synchronizes them to Google Docs.
+Titen is a native desktop meeting transcription application for macOS and Windows built with MyGo native GPU widgets, Go, and platform-specific native capture helpers. It captures microphone and playback audio, streams mixed speech to Soniox, saves finalized transcripts in SQLite, and synchronizes them to Google Docs.
 
 The macOS application builds locally. Windows builds and tests run on GitHub-hosted Windows runners. Live capture and provider acceptance remain unverified in this environment. Read [verification results](docs/verification.md) before relying on it for a meeting.
 
-## Build and run
+## Build and run on macOS
 
 You need macOS 15 or later, Xcode Command Line Tools with Swift, and Go 1.27.1 or later. The native build does not need Node, Bun, Vite, or a web server.
 
@@ -67,13 +67,15 @@ Document creation and transcript synchronization retry independently of recordin
 
 ## Record a meeting
 
+On Windows, enable desktop microphone access in Windows Settings under Privacy & security > Microphone. System audio uses the default playback endpoint.
+
 Approve microphone and Screen & System Audio Recording permission when macOS requests them. If access fails, open **System Settings > Privacy & Security**, grant access to Titen, and start again.
 
 The main window shows recording state, elapsed recording time, separate audio meters, finalized text, partial speech, and cloud sync status. The live view retains the latest 500 finalized segments. Complete transcripts remain in **History**.
 
 Closing the window hides it. Recording continues. The menu bar provides start, pause, resume, stop, open, and quit actions. Quit ends capture and allows up to 15 seconds for final transcription before leaving.
 
-Pause terminates capture. To change microphones, pause, open **Settings**, refresh the microphone list, choose a device, save, and resume. Source modes support both inputs, microphone only, and system audio only. Microphone-only mode uses AVFoundation and requires microphone permission only.
+Pause terminates capture. To change microphones, pause, open **Settings**, refresh the microphone list, choose a device, save, and resume. Source modes support both inputs, microphone only, and system audio only. On macOS, microphone-only mode uses AVFoundation and requires microphone permission only. Windows uses WASAPI.
 
 In **Settings**, click **Test microphone for 10 seconds** to check the selected input before recording. The live test meter shows microphone input only. **Stop microphone test** ends it early. This test creates no meeting, writes no audio file, and makes no Soniox or Google request. It requires microphone access only.
 
@@ -87,7 +89,7 @@ Data lives in `~/Library/Application Support/Titen/` on macOS and `%AppData%\Tit
 
 ## Understand recovery limits
 
-Unsent audio is buffered in a private, unlinked temporary disk file during an active session. The total spool limit is 1 GiB. It is removed at session cleanup and cannot recover audio after an application crash. Audio already sent without confirmation can be lost after a provider disconnect. The UI reports disconnections and buffer overflow.
+Unsent audio is buffered in a private temporary disk file with automatic cleanup during an active session. The total spool limit is 1 GiB. It is removed at session cleanup and cannot recover audio after an application crash. Audio already sent without confirmation can be lost after a provider disconnect. The UI reports disconnections and buffer overflow.
 
 Native stream interruptions trigger at most three capture restarts within the same meeting. Permission failures require correction in System Settings. A temporary Google outage retains document creation requests and transcript batches across application restarts. Ambiguous append responses are reconciled using atomic named ranges and revision checks. Keep the app's named ranges in the document intact.
 
