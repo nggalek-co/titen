@@ -1,0 +1,12 @@
+warning: /Users/famasya/Library/org.swift.swiftpm/configuration is not accessible or not writable, disabling user-level cache features.
+warning: /Users/famasya/Library/org.swift.swiftpm/security is not accessible or not writable, disabling user-level cache features.
+warning: /Users/famasya/Library/Caches/org.swift.swiftpm is not accessible or not writable, disabling user-level cache features.
+warning: 'macos': failed storing manifest for 'macos' in cache: attempt to write a readonly database
+[0/1] Planning build
+Building for production...
+[0/2] Write swift-version--1AB21518FC5DEDBE.txt
+Build complete! (0.14s)
+build/Titen.app/Contents/Info.plist: OK
+build/Titen.app/Contents/MacOS/titen-audio: replacing existing signature
+build/Titen.app: replacing existing signature
+Built build/Titen.app

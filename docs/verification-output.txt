@@ -1,0 +1,8 @@
+ok  	titen	2.635s
+ok  	titen/internal/app	(cached)
+ok  	titen/internal/audio	(cached)
+ok  	titen/internal/auth	(cached)
+ok  	titen/internal/storage	(cached)
+ok  	titen/internal/sync	(cached)
+?   	titen/internal/transcript	[no test files]
+ok  	titen/internal/transcription	(cached)

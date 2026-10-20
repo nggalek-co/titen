@@ -1,0 +1,10 @@
+{
+  "name": "titen",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "go run .",
+    "build": "sh scripts/build-macos.sh",
+    "test": "go test -race ./..."
+  }
+}

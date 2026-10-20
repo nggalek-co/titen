@@ -1,0 +1,8 @@
+node_modules/
+/dist/
+/build/
+/.mygo/
+mygo_windows_*.syso
+
+/.cache/
+/native/macos/.build/
