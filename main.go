@@ -9,8 +9,8 @@ import (
 	"image/png"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +20,7 @@ import (
 	"titen/internal/app"
 	"titen/internal/audio"
 	"titen/internal/auth"
+	"titen/internal/platform"
 	"titen/internal/storage"
 	docsync "titen/internal/sync"
 	"titen/internal/transcript"
@@ -81,7 +82,7 @@ func (d *desktop) currentGoogle() *auth.Google {
 	return d.google
 }
 func (d *desktop) replaceGoogle(id string) {
-	g := &auth.Google{ClientID: id, ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"), ClientSecretLookup: func() (string, error) { return auth.GetSecret("google-client-secret/" + id) }, OpenBrowser: func(url string) error { return exec.Command("open", url).Run() }}
+	g := &auth.Google{ClientID: id, ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"), ClientSecretLookup: func() (string, error) { return auth.GetSecret("google-client-secret/" + id) }, OpenBrowser: mygo.Shell.OpenExternal}
 	d.authMu.Lock()
 	if d.google != nil && d.google.ClientID == id {
 		d.authMu.Unlock()
@@ -525,7 +526,7 @@ func (d *desktop) settingsView(c *ui.Context) {
 	ui.Scroll(c.Key("settings")).Grow(1).FillWidth().Gap(16).Children(func() {
 		ui.Row(c).Padding(12, 16).Gap(12).Radius(t.Radius).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
 			ui.Icon(c, keyIcon).Size(16, 16).TextColor(t.TextMuted)
-			ui.Text(c, "Credentials stay in macOS Keychain. Transcripts stay on this Mac.").FontSize(12).FontWeight(500).Grow(1)
+			ui.Text(c, "Credentials stay in "+platform.CredentialStore(runtime.GOOS)+". Transcripts stay on this device.").FontSize(12).FontWeight(500).Grow(1)
 			ui.PrimaryButton(c, "Save settings").Disabled(d.busy || d.microphoneTesting || d.snapshot.State != app.Idle && d.snapshot.State != app.Paused).OnClick(d.save)
 		})
 		ui.Row(c).Gap(16).AlignItems(ui.Stretch).Wrap().Children(func() {
@@ -696,6 +697,9 @@ func trayIcon() []byte {
 	_ = png.Encode(&b, img)
 	return b.Bytes()
 }
+
+var version = "dev"
+
 func main() {
 	dir, err := os.UserConfigDir()
 	if err != nil {
@@ -714,11 +718,10 @@ func main() {
 	}
 	if cfg.HelperPath == "" {
 		exe, _ := os.Executable()
-		cfg.HelperPath = filepath.Join(filepath.Dir(exe), "titen-audio")
-		if _, err = os.Stat(cfg.HelperPath); err != nil {
-			cfg.HelperPath = filepath.Join("native", "macos", ".build", "release", "titen-audio")
-		}
+		cwd, _ := os.Getwd()
+		cfg.HelperPath = platform.HelperPath(runtime.GOOS, exe, cwd)
 	}
+
 	store, err := storage.Open(filepath.Join(dir, "titen.sqlite3"))
 	if err != nil {
 		slog.Error("open database", "error", err)
@@ -727,13 +730,14 @@ func main() {
 	defer store.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	google := &auth.Google{ClientID: cfg.GoogleClientID, ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"), ClientSecretLookup: func() (string, error) { return auth.GetSecret("google-client-secret/" + cfg.GoogleClientID) }, OpenBrowser: func(url string) error { return exec.Command("open", url).Run() }}
+	google := &auth.Google{ClientID: cfg.GoogleClientID, ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"), ClientSecretLookup: func() (string, error) { return auth.GetSecret("google-client-secret/" + cfg.GoogleClientID) }, OpenBrowser: mygo.Shell.OpenExternal}
 	d := &desktop{service: app.NewService(store), store: store, dir: dir, settings: cfg, page: "Record", syncStatus: "Google Docs sync idle", root: ctx, cancel: cancel, microphone: "System default", google: google}
 	d.docs = &docsync.GoogleDocs{Token: func(ctx context.Context) (string, error) { return d.currentGoogle().Token(ctx) }}
 	d.liveList.FollowEnd = true
 	if cfg.MicrophoneID != "" {
 		d.microphone = cfg.MicrophoneID
 	}
+	slog.Info("starting Titen", "version", version, "os", runtime.GOOS, "arch", runtime.GOARCH)
 	mygo.App.SetName("Titen")
 	mygo.App.OnWindowAllClosed(func() {})
 	mygo.App.WhenReady(d.ready)
@@ -791,7 +795,7 @@ func renderSegmentRow(c *ui.Context, s transcript.Segment) {
 		who = "1"
 	}
 	ui.Row(c).FillWidth().Padding(10, 12).Gap(12).Radius(t.Radius).Border(1, t.Border).AlignItems(ui.Start).Children(func() {
-		ui.Box(c).Padding(2, 7).Radius(t.Radius - 2).Border(1, t.Border).Shrink(0).Children(func() {
+		ui.Box(c).Padding(2, 7).Radius(t.Radius-2).Border(1, t.Border).Shrink(0).Children(func() {
 			ui.Text(c, stamp).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
 		})
 		ui.Badge(c, "Speaker "+who)

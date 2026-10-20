@@ -3,30 +3,21 @@ package audio
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"titen/internal/testhelper"
 )
 
-func microphoneFixture(t *testing.T, source byte, script string) (CaptureConfig, string) {
+func microphoneFixture(t *testing.T, source byte, config testhelper.CaptureConfig) (CaptureConfig, string) {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "frames"), wire(source, 16000, 1, []int16{16384, -16384}), 0600); err != nil {
-		t.Fatal(err)
-	}
-	helper := filepath.Join(dir, "helper")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"+script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	return CaptureConfig{HelperPath: helper, MicrophoneID: "chosen-device"}, dir
+	config.Frames = wire(source, 16000, 1, []int16{16384, -16384})
+	helper, _ := testhelper.Capture(t, config)
+	return CaptureConfig{HelperPath: helper, MicrophoneID: "chosen-device"}, helper
 }
 
 func TestMicrophoneUsesSelectedDeviceAndReportsLocalLevel(t *testing.T) {
-	cfg, dir := microphoneFixture(t, 1, `printf '%s\n' "$@" > "$(dirname "$0")/args"
-cat "$(dirname "$0")/frames"
-exec sleep 30
-`)
+	cfg, helper := microphoneFixture(t, 1, testhelper.CaptureConfig{})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	level := float64(0)
@@ -34,7 +25,7 @@ exec sleep 30
 	if err != nil || result.Frames != 1 || level != 0.5 || result.Peak != 0.5 {
 		t.Fatalf("result=%+v level=%f err=%v", result, level, err)
 	}
-	args, err := os.ReadFile(filepath.Join(dir, "args"))
+	args, err := os.ReadFile(helper + ".args")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,9 +34,7 @@ exec sleep 30
 	}
 }
 func TestMicrophoneIgnoresSystemAudioAndReportsNoInput(t *testing.T) {
-	cfg, _ := microphoneFixture(t, 2, `cat "$(dirname "$0")/frames"
-exec sleep 30
-`)
+	cfg, _ := microphoneFixture(t, 2, testhelper.CaptureConfig{})
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	result, err := TestMicrophone(ctx, cfg, func(float64) { t.Error("system audio reached microphone meter") })
@@ -54,7 +43,7 @@ exec sleep 30
 	}
 }
 func TestMicrophoneShowsPermissionFailure(t *testing.T) {
-	cfg, _ := microphoneFixture(t, 1, "echo 'Microphone access denied' >&2\nexit 1\n")
+	cfg, _ := microphoneFixture(t, 1, testhelper.CaptureConfig{Stderr: "Microphone access denied\n", ExitImmediately: true, ExitCode: 1})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_, err := TestMicrophone(ctx, cfg, nil)

@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -27,7 +26,9 @@ type Capture struct {
 }
 
 func ListDevices(ctx context.Context, helperPath string) ([]Device, error) {
-	out, err := exec.CommandContext(ctx, helperPath, "--list-devices").Output()
+	cmd := exec.CommandContext(ctx, helperPath, "--list-devices")
+	configureHelperCommand(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("list microphones: %w", err)
 	}
@@ -55,7 +56,16 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 		args = append(args, "--microphone", cfg.MicrophoneID)
 	}
 	cmd := exec.CommandContext(ctx, cfg.HelperPath, args...)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	configureHelperCommand(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	cmd.Cancel = func() error {
+		_, _ = io.WriteString(stdin, "\n")
+		return stdin.Close()
+	}
 	cmd.WaitDelay = 2 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -79,6 +89,7 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 	c := &Capture{Frames: frames, Errors: errs, cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(c.done)
+		defer stdin.Close()
 		defer close(frames)
 		defer close(errs)
 		var readErr error

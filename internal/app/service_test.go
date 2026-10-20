@@ -2,26 +2,23 @@ package app
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 	"titen/internal/storage"
+	"titen/internal/testhelper"
 	"titen/internal/transcript"
 	"titen/internal/transcription"
 )
 
-func serviceFixture(t *testing.T, script string) (*Service, Settings) {
+func serviceFixture(t *testing.T, config testhelper.CaptureConfig) (*Service, Settings) {
 	t.Helper()
 	store, err := storage.Open(filepath.Join(t.TempDir(), "test.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	helper := filepath.Join(t.TempDir(), "helper")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"+script), 0700); err != nil {
-		t.Fatal(err)
-	}
+	helper, _ := testhelper.Capture(t, config)
 	s := NewService(store)
 	s.finishTimeout = 100 * time.Millisecond
 	s.run = func(ctx context.Context, chunks <-chan []byte, notify func(transcription.Update)) error {
@@ -52,7 +49,7 @@ func awaitIdle(t *testing.T, s *Service) {
 }
 
 func TestCaptureFailureFinishesAndAllowsRestart(t *testing.T) {
-	s, cfg := serviceFixture(t, "echo permission denied >&2\nexit 1\n")
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{Stderr: "permission denied\n", ExitImmediately: true, ExitCode: 1})
 	ctx := context.Background()
 	if err := s.Start(ctx, cfg, "key", "failed"); err != nil {
 		t.Fatal(err)
@@ -72,7 +69,7 @@ func TestCaptureFailureFinishesAndAllowsRestart(t *testing.T) {
 }
 
 func TestPauseResumeAndStopDrainsDeduplicatedFinals(t *testing.T) {
-	s, cfg := serviceFixture(t, "exec sleep 30\n")
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{})
 	ctx := context.Background()
 	s.run = func(ctx context.Context, chunks <-chan []byte, notify func(transcription.Update)) error {
 		for range chunks {
@@ -115,7 +112,7 @@ func TestPauseResumeAndStopDrainsDeduplicatedFinals(t *testing.T) {
 }
 
 func TestStopBoundsUncooperativeNetworkAndRejectsLateUpdate(t *testing.T) {
-	s, cfg := serviceFixture(t, "exec sleep 30\n")
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{})
 	release := make(chan struct{})
 	exited := make(chan struct{})
 	s.run = func(ctx context.Context, chunks <-chan []byte, notify func(transcription.Update)) error {
@@ -147,7 +144,7 @@ func TestStopBoundsUncooperativeNetworkAndRejectsLateUpdate(t *testing.T) {
 
 func TestCaptureInterruptionRecoversSameMeeting(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "interrupted")
-	s, cfg := serviceFixture(t, "if [ ! -f '"+marker+"' ]; then touch '"+marker+"'; echo 'Capture interrupted. Device changed' >&2; exit 2; fi\nexec sleep 30\n")
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{InterruptMarker: marker})
 	ctx := context.Background()
 	if err := s.Start(ctx, cfg, "key", "meeting"); err != nil {
 		t.Fatal(err)
