@@ -10,7 +10,7 @@ The local macOS ARM64 app and Swift helper compiled, passed ad hoc signature val
 
 ## GitHub native checks
 
-Native checks run in [Desktop builds](https://github.com/nggalek-co/titen/actions/runs/39511605664) for PR 1. The first native run passed the macOS ARM64 job and exposed a Windows spool failure. Windows forbids removing the default temporary-file handle while it is open. The fix uses a delete-on-close Windows handle and adds an executable cleanup test. A native rerun is pending at this checkpoint. The workflow uses the same tests and package commands on pushed version tags.
+Native checks run in [Desktop builds](https://github.com/nggalek-co/titen/actions/runs/39511605664) for PR 1. The first native run passed the macOS ARM64 job and exposed a Windows spool failure. Windows forbids removing the default temporary-file handle while it is open. The fix uses a delete-on-close Windows handle and adds an executable cleanup test. The [rerun on commit 9680581](https://github.com/nggalek-co/titen/actions/runs/39512151176) passed all three native jobs: macOS ARM64, macOS Intel, and Windows AMD64. Windows executed the Go tests, Credential Manager roundtrip, spool cleanup test, and native CTest. All three packages passed archive and checksum validation on their runners and after download. The workflow uses the same tests and package commands on pushed version tags.
 
 The branch was pushed through the existing SSH identity. HTTPS authentication could read the repository but lacked the workflow scope required to push an Actions file. No token scopes or credential configuration were changed.
 

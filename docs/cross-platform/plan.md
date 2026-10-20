@@ -5,9 +5,9 @@
 - [x] Read the Principles section of poteto-mode.
 - [x] Frame.
 - [x] Design the workflow.
-- [ ] Run the loop.
-- [ ] Keep the audit trail.
-- [ ] Verify and hand back.
+- [x] Run the loop.
+- [x] Keep the audit trail.
+- [x] Verify and hand back.
 
 ## Done predicate
 
@@ -30,13 +30,13 @@ SQLite alternatives were bundled Cgo SQLite and modernc SQLite through database/
 
 ## Checks
 
-- [ ] Preserve existing database files and transactional outbox behavior.
-- [ ] Compile Windows packages without Cgo.
-- [ ] Run lifecycle tests on Windows and macOS without a shell fixture dependency.
-- [ ] Build Swift and Windows WASAPI helpers.
-- [ ] Run Windows helper conversion and frame self-tests without recording.
-- [ ] Build macOS ARM64 and Windows AMD64 archives containing app and helper.
-- [ ] Run GitHub Actions on the feature branch and inspect downloadable artifacts.
-- [ ] Review code, workflow permissions, packaging, and acceptance limits.
+- [x] Preserve existing database files and transactional outbox behavior.
+- [x] Compile Windows packages without Cgo.
+- [x] Run lifecycle tests on Windows and macOS without a shell fixture dependency.
+- [x] Build Swift and Windows WASAPI helpers.
+- [x] Run Windows helper conversion and frame self-tests without recording.
+- [x] Build macOS ARM64, macOS Intel, and Windows AMD64 archives containing app and helper.
+- [x] Run GitHub Actions on the feature branch and inspect downloadable artifacts.
+- [x] Review code, workflow permissions, packaging, and acceptance limits.
 
 The SaaS backend in PRD 002 remains a separate implementation. This work ports the existing desktop application and release process.
