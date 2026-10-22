@@ -1,0 +1,5 @@
+ts	phase	decision	why	evidence	result
+2026-10-21T00:00:00Z	frame	Default endpoint to localhost3000 and pair using device codes	User requests local integration first	../titen-web/src/routes/api/device/codes.ts	contract observed
+2026-10-21T03:00:00Z	verify	Blank SONIOX_WS_URL in .env.local crashed streaming with Invalid URL	Empty string overrode the default upstream URL in pickUpstream	live worker log at GET /api/stream; ../titen-web/src/lib/transcription/upstream.ts	fixed upstream and covered in ../titen-web/test/stream.test.ts
+2026-10-21T03:00:00Z	verify	Real localhost worker smoke passed end to end	Plan gate: run the local worker integration without ambient audio or provider credentials	Device code S6N9KLZM paired, synthetic 2500 ms PCM streamed to dev echo upstream, meeting complete, session closed, 7 units settled in D1 ledger	done
+2026-10-22T00:37:48Z	design	Render the live transcript from persisted segments on a titen-web realtime page	Docs API project write quota caps near-realtime per-segment writes for 100 concurrent recorders; persist-first keeps one seq ordering contract	docs/saas-integration/realtime-canvas.md	decision recorded
