@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"sync"
@@ -56,6 +57,7 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 		args = append(args, "--microphone", cfg.MicrophoneID)
 	}
 	cmd := exec.CommandContext(ctx, cfg.HelperPath, args...)
+	slog.Info("starting audio helper", "helper", cfg.HelperPath, "mode", cfg.Mode, "microphone_id", cfg.MicrophoneID)
 	configureHelperCommand(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -82,6 +84,7 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 	stderr := &limitedError{report: report}
 	cmd.Stderr = stderr
 	if err = cmd.Start(); err != nil {
+		slog.Error("audio helper start failed", "error", err)
 		cancel()
 		return nil, fmt.Errorf("start native audio helper: %w", err)
 	}
@@ -121,6 +124,11 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 			}
 		}
 		waitErr := cmd.Wait()
+		if ctx.Err() == nil && waitErr != nil {
+			slog.Error("audio helper exited", "pid", cmd.Process.Pid, "error", waitErr, "stderr", stderr.String(), "read_error", readErr)
+		} else {
+			slog.Info("audio helper stopped", "pid", cmd.Process.Pid, "cancelled", ctx.Err() != nil)
+		}
 		finalReport := func(err error) {
 			select {
 			case errs <- err:

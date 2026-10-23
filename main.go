@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -17,44 +19,78 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"github.com/oneo-me/onevra/source/components"
+	"github.com/oneo-me/onevra/source/icons/lucide"
+	"github.com/oneo-me/onevra/source/shells/sidebar"
 	"titen/internal/app"
 	"titen/internal/audio"
 	"titen/internal/auth"
 	"titen/internal/platform"
+	"titen/internal/saas"
 	"titen/internal/storage"
-	docsync "titen/internal/sync"
 	"titen/internal/transcript"
+	"titen/locales"
+)
+
+type endpointHealth int
+
+const (
+	endpointUnknown endpointHealth = iota
+	endpointReady
+	endpointAttention
+	endpointDown
+)
+
+type endpointStatus struct {
+	health      endpointHealth
+	detailKey   string
+	minutesLeft int
+}
+
+type audioCheckPhase int
+
+const (
+	audioUnchecked audioCheckPhase = iota
+	audioChecking
+	audioReady
+	audioFailed
 )
 
 type desktop struct {
-	win                            *mygo.Window
-	tray                           *mygo.Tray
-	service                        *app.Service
-	store                          *storage.Store
-	dir                            string
-	settings                       app.Settings
-	page                           string
-	title, key, search, documentID string
-	message, syncStatus            string
-	snapshot                       app.Snapshot
-	meetings                       []storage.Meeting
-	detail                         []transcript.Segment
-	selected                       string
-	devices                        []audio.Device
-	microphone                     string
-	google                         *auth.Google
-	googleSecret                   string
-	authMu                         sync.RWMutex
-	tasks                          sync.WaitGroup
-	liveList                       ui.ListState
-	docs                           *docsync.GoogleDocs
-	root                           context.Context
-	cancel                         context.CancelFunc
-	busy, quitting                 bool
-	microphoneTesting              bool
-	microphoneTestLevel            float64
-	microphoneTestStatus           string
-	microphoneTestCancel           context.CancelFunc
+	audioCheck                             string
+	audioPhase                             audioCheckPhase
+	audioCheckGeneration                   uint64
+	endpointGeneration                     uint64
+	win                                    *mygo.Window
+	shell                                  *sidebar.Shell
+	tray                                   *mygo.Tray
+	trayMenu                               *mygo.Menu
+	trayCanRecord                          bool
+	trayState                              app.State
+	service                                *app.Service
+	store                                  *storage.Store
+	dir                                    string
+	settings                               app.Settings
+	page                                   string
+	title, search                          string
+	endpointInput, deviceCode, deviceToken string
+	endpoint                               endpointStatus
+	message                                string
+	snapshot                               app.Snapshot
+	meetings                               []storage.Meeting
+	detail                                 []transcript.Segment
+	selected                               string
+	devices                                []audio.Device
+	microphone                             string
+	tasks                                  sync.WaitGroup
+	liveList                               ui.ListState
+	root                                   context.Context
+	cancel                                 context.CancelFunc
+	busy, quitting                         bool
+	microphoneTesting                      bool
+	microphoneTestLevel                    float64
+	microphoneTestStatus                   string
+	microphoneTestCancel                   context.CancelFunc
 }
 
 func (d *desktop) async(work func() error) {
@@ -71,53 +107,108 @@ func (d *desktop) async(work func() error) {
 			if err != nil {
 				d.message = err.Error()
 			} else {
-				d.message = "Done"
+				d.message = locales.T("done")
 			}
 		})
 	}()
 }
-func (d *desktop) currentGoogle() *auth.Google {
-	d.authMu.RLock()
-	defer d.authMu.RUnlock()
-	return d.google
+
+// tr formats a catalog message for the frame's locale.
+func (d *desktop) tr(c *ui.Context, key string) string {
+	return locales.Catalog.Format(c.Locale(), key, nil)
 }
-func (d *desktop) replaceGoogle(id string) {
-	g := &auth.Google{ClientID: id, ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"), ClientSecretLookup: func() (string, error) { return auth.GetSecret("google-client-secret/" + id) }, OpenBrowser: mygo.Shell.OpenExternal}
-	d.authMu.Lock()
-	if d.google != nil && d.google.ClientID == id {
-		d.authMu.Unlock()
-		return
-	}
-	d.google = g
-	d.authMu.Unlock()
+func (d *desktop) trf(c *ui.Context, key string, args map[string]any) string {
+	return locales.Catalog.Format(c.Locale(), key, args)
 }
-func (d *desktop) start() {
-	if d.microphoneTesting {
-		d.message = "Stop the microphone test before starting a meeting"
-		return
+func (d *desktop) t(key string) string { return locales.T(key) }
+
+func (d *desktop) stateLabel(c *ui.Context, s app.State) string {
+	return d.tr(c, "state."+string(s))
+}
+
+func (d *desktop) captureLabel(c *ui.Context, mode string) string {
+	switch mode {
+	case "Microphone only":
+		return d.tr(c, "captureMic")
+	case "System audio only":
+		return d.tr(c, "captureSystem")
 	}
-	cfg, title, existingDoc := d.settings, d.title, strings.TrimSpace(d.documentID)
+	return d.tr(c, "captureBoth")
+}
+
+func (d *desktop) connectAccount() {
+	endpoint := d.settings.ServerEndpoint
 	d.async(func() error {
-		key, err := auth.GetSecret("soniox")
+		client := &saas.Client{BaseURL: endpoint}
+		code, err := client.BeginDevice(d.root, "Titen desktop")
 		if err != nil {
-			return fmt.Errorf("Soniox key: %w", err)
+			return err
+		}
+		if err = mygo.Shell.OpenExternal(code.VerifyURL); err != nil {
+			return fmt.Errorf("open sign-in page: %w", err)
+		}
+		d.win.Update(func() {
+			d.deviceCode = code.Code
+			d.message = locales.T("approveInBrowser")
+		})
+		ctx, cancel := context.WithDeadline(d.root, code.ExpiresAt)
+		defer cancel()
+		token, err := client.WaitDevice(ctx, code)
+		if err != nil {
+			return err
+		}
+		key := saas.TokenKey(endpoint)
+		if key == "" {
+			return errors.New(locales.T("invalidEndpoint"))
+		}
+		if err = auth.SetSecret(key, token); err != nil {
+			return err
+		}
+		d.win.Update(func() { d.deviceToken = token; d.deviceCode = ""; d.probe() })
+		return nil
+	})
+}
+func (d *desktop) canRecord() bool {
+	return !d.busy && !d.microphoneTesting && d.audioPhase == audioReady && d.endpoint.health == endpointReady
+}
+
+func (d *desktop) resume() {
+	if !d.canRecord() || d.snapshot.State != app.Paused {
+		d.message = locales.T("checkupRequired")
+		return
+	}
+	d.async(func() error { return d.service.Resume(d.root) })
+}
+
+func (d *desktop) start() {
+	if !d.canRecord() || d.snapshot.State != app.Idle {
+		d.message = locales.T("checkupRequired")
+		return
+	}
+	cfg, title := d.settings, d.title
+	key := d.deviceToken
+	if key == "" {
+		var err error
+		key, err = auth.GetSecret(saas.TokenKey(cfg.ServerEndpoint))
+		if err != nil || key == "" {
+			d.message = locales.T("signInFirst")
+			return
+		}
+	}
+	d.async(func() error {
+		budget, err := (&saas.Client{BaseURL: cfg.ServerEndpoint, Token: key}).Budget(d.root)
+		status := classifyBudget(budget, err)
+		d.win.Update(func() { d.endpoint = status })
+		switch status.health {
+		case endpointDown:
+			return errors.New(locales.Tf("recordingDidNotStart", map[string]any{"detail": locales.T(status.detailKey)}))
+		case endpointAttention:
+			return errors.New(locales.Tf("openSettingsHint", map[string]any{"detail": locales.T(status.detailKey)}))
 		}
 		if strings.TrimSpace(title) == "" {
 			title = "Meeting " + time.Now().Format("2006-01-02 15:04")
 		}
-		if existingDoc != "" {
-			cfg.AutoSync = false
-			if err := d.docs.CheckDocument(d.root, existingDoc); err != nil {
-				return fmt.Errorf("check existing Google Doc: %w", err)
-			}
-		}
-		if err = d.service.Start(d.root, cfg, key, title); err != nil {
-			return err
-		}
-		if existingDoc != "" {
-			return d.store.SetDocument(d.root, d.service.Snapshot().MeetingID, existingDoc)
-		}
-		return nil
+		return d.service.Start(d.root, cfg, key, title)
 	})
 }
 func (d *desktop) stop() {
@@ -126,6 +217,30 @@ func (d *desktop) stop() {
 		return
 	}
 	d.async(func() error { return d.service.Stop(d.root) })
+}
+
+func (d *desktop) setCaptureInputs(microphone, system bool) {
+	if !microphone && !system || d.busy || d.snapshot.State != app.Idle && d.snapshot.State != app.Paused {
+		return
+	}
+	mode := "Both"
+	if !microphone {
+		mode = "System audio only"
+	} else if !system {
+		mode = "Microphone only"
+	}
+	cfg := d.settings
+	cfg.CaptureMode = mode
+	d.async(func() error {
+		if err := d.service.ConfigureCapture(cfg); err != nil {
+			return err
+		}
+		if err := app.SaveSettings(d.dir, cfg); err != nil {
+			return err
+		}
+		d.win.Update(func() { d.settings = cfg; d.checkAudio() })
+		return nil
+	})
 }
 func (d *desktop) history() {
 	d.page = "History"
@@ -162,7 +277,7 @@ func (d *desktop) refreshDevices() {
 	})
 }
 func (d *desktop) save() {
-	cfg, key, googleSecret := d.settings, d.key, d.googleSecret
+	cfg := d.settings
 	for _, device := range d.devices {
 		if deviceLabel(device) == d.microphone {
 			cfg.MicrophoneID = device.ID
@@ -171,20 +286,14 @@ func (d *desktop) save() {
 	if d.microphone == "System default" {
 		cfg.MicrophoneID = ""
 	}
+	endpoint, err := saas.NormalizeEndpoint(d.endpointInput)
+	if err != nil {
+		d.message = err.Error()
+		return
+	}
+	cfg.ServerEndpoint = endpoint
+	old := d.settings.ServerEndpoint
 	d.async(func() error {
-		if key != "" {
-			if err := auth.SetSecret("soniox", key); err != nil {
-				return err
-			}
-		}
-		if googleSecret != "" {
-			if cfg.GoogleClientID == "" {
-				return fmt.Errorf("enter the Google client ID before saving its secret")
-			}
-			if err := auth.SetSecret("google-client-secret/"+cfg.GoogleClientID, googleSecret); err != nil {
-				return err
-			}
-		}
 		if err := d.service.ConfigureCapture(cfg); err != nil {
 			return err
 		}
@@ -193,74 +302,284 @@ func (d *desktop) save() {
 		}
 		d.win.Update(func() {
 			d.settings = cfg
-			d.key = ""
-			d.googleSecret = ""
-			d.replaceGoogle(cfg.GoogleClientID)
+			d.endpointInput = cfg.ServerEndpoint
+			if old != cfg.ServerEndpoint {
+				d.deviceToken = ""
+			}
+			d.applyLanguage()
+			d.refreshLocale()
+			d.message = locales.T("settingsSaved")
+			d.probe()
 		})
 		return nil
 	})
 }
-func (d *desktop) view(c *ui.Context) {
-	c.OnShortcut(ui.Cmd, ui.KeyW, d.win.Hide)
+
+// applyLanguage makes MyGo, Onevra and the app's own strings follow the saved
+// choice; "system" follows the user's languages again.
+func (d *desktop) applyLanguage() {
+	mygo.App.SetLocale(locales.Tag(d.settings.Language))
+}
+
+// refreshLocale re-applies localized chrome after the language changes.
+func (d *desktop) refreshLocale() {
+	if d.win != nil {
+		d.win.SetTitle(locales.T("appTitle"))
+	}
+	if d.tray != nil {
+		d.trayMenu = d.menu()
+		d.syncTrayMenu()
+		d.tray.SetMenu(d.trayMenu)
+	}
+	if d.win != nil {
+		d.win.Invalidate()
+	}
+}
+
+func classifyBudget(b saas.Budget, err error) endpointStatus {
+	if err == nil {
+		if b.MinutesLeft <= 0 {
+			return endpointStatus{health: endpointAttention, detailKey: "outOfCredit"}
+		}
+		if b.MinutesLeft < 10 {
+			return endpointStatus{health: endpointAttention, detailKey: "minimumCredit"}
+		}
+		return endpointStatus{health: endpointReady, minutesLeft: b.MinutesLeft}
+	}
+	var api *saas.APIError
+	if errors.As(err, &api) {
+		switch api.Status {
+		case 401, 403:
+			return endpointStatus{health: endpointAttention, detailKey: "signInRequired"}
+		case 402:
+			return endpointStatus{health: endpointAttention, detailKey: "outOfCredit"}
+		}
+		return endpointStatus{health: endpointDown, detailKey: "serverError"}
+	}
+	return endpointStatus{health: endpointDown, detailKey: "serverUnreachable"}
+}
+
+// probe refreshes the endpoint status pill. Read desktop fields on the UI
+// thread; the network call runs in a task goroutine.
+func (d *desktop) probe() {
+	d.endpointGeneration++
+	generation := d.endpointGeneration
+	d.endpoint = endpointStatus{health: endpointUnknown}
+	d.checkAudio()
+	endpoint := d.settings.ServerEndpoint
+	token := d.deviceToken
+	if token == "" {
+		var err error
+		token, err = auth.GetSecret(saas.TokenKey(endpoint))
+		if err == nil && token != "" {
+			d.deviceToken = token
+		}
+	}
+	if token == "" {
+		d.endpoint = endpointStatus{health: endpointAttention, detailKey: "notSignedIn"}
+		return
+	}
+	d.tasks.Add(1)
+	go func() {
+		defer d.tasks.Done()
+		ctx, cancel := context.WithTimeout(d.root, 10*time.Second)
+		defer cancel()
+		budget, err := (&saas.Client{BaseURL: endpoint, Token: token}).Budget(ctx)
+		status := classifyBudget(budget, err)
+		slog.Info("account check completed", "health", status.health, "minutes_left", status.minutesLeft, "error", err)
+		d.win.Update(func() {
+			if generation == d.endpointGeneration {
+				d.endpoint = status
+			}
+		})
+	}()
+}
+
+func (d *desktop) requestAudioAccess() {
+	if d.audioPhase == audioChecking {
+		return
+	}
+	d.audioCheckGeneration++
+	generation := d.audioCheckGeneration
+	d.audioPhase = audioChecking
+	d.audioCheck = locales.T("checkupRunning")
+	cfg := audio.CaptureConfig{HelperPath: d.settings.HelperPath, Mode: d.settings.CaptureMode}
+	d.tasks.Add(1)
+	go func() {
+		defer d.tasks.Done()
+		ctx, cancel := context.WithTimeout(d.root, time.Minute)
+		defer cancel()
+		err := audio.RequestPermissions(ctx, cfg)
+		slog.Info("audio permission request completed", "mode", cfg.Mode, "error", err)
+		d.win.Update(func() {
+			if generation != d.audioCheckGeneration {
+				return
+			}
+			if err != nil {
+				d.audioPhase = audioFailed
+				d.audioCheck = err.Error()
+				return
+			}
+			d.probe()
+		})
+	}()
+}
+
+func (d *desktop) checkAudio() {
+	d.audioCheckGeneration++
+	generation := d.audioCheckGeneration
+	d.audioPhase = audioChecking
+	d.audioCheck = locales.T("checkupRunning")
+	cfg := audio.CaptureConfig{HelperPath: d.settings.HelperPath, Mode: d.settings.CaptureMode}
+	d.tasks.Add(1)
+	go func() {
+		defer d.tasks.Done()
+		ctx, cancel := context.WithTimeout(d.root, 10*time.Second)
+		defer cancel()
+		err := audio.CheckPermissions(ctx, cfg)
+		slog.Info("audio startup check completed", "mode", cfg.Mode, "error", err)
+		d.win.Update(func() {
+			if generation != d.audioCheckGeneration {
+				return
+			}
+			d.audioPhase = audioReady
+			d.audioCheck = locales.T("checkupAudioReady")
+			if err != nil {
+				d.audioPhase = audioFailed
+				d.audioCheck = err.Error()
+			}
+		})
+	}()
+}
+
+func formatMinutes(min int) string {
+	if min >= 60 {
+		return fmt.Sprintf("%dh %dm", min/60, min%60)
+	}
+	return fmt.Sprintf("%d min", min)
+}
+
+// titlebar builds the floating header area: the recording state and the
+// endpoint status pills.
+func (d *desktop) titlebar(c *ui.Context) {
 	t := c.Theme()
-	ui.Column(c).Fill().Children(func() {
-		ui.Row(c).Padding(14, 24).Gap(16).AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Children(func() {
-			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
-				ui.Box(c).Size(32, 32).Radius(t.Radius).Border(1, t.Border).Center().Children(func() {
-					ui.Icon(c, micIcon).Size(16, 16)
-				})
-				ui.Column(c).Gap(1).Children(func() {
-					ui.Text(c, "Titen").FontSize(18).Bold()
-					ui.Text(c, "Meeting Transcription Studio").FontSize(11).TextColor(t.TextMuted)
-				})
-			})
-			ui.Spacer(c)
-			ui.Row(c).Padding(4, 10).Gap(7).Radius(999).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
-				dot := t.TextMuted
-				if d.snapshot.State == app.Recording {
-					dot = t.Danger
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Padding(4, 10).Gap(7).Radius(999).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
+			dot := t.TextMuted
+			label := d.tr(c, "checkingServer")
+			switch d.endpoint.health {
+			case endpointReady:
+				dot = t.Success
+				mins := d.endpoint.minutesLeft
+				if d.snapshot.MinutesKnown {
+					mins = d.snapshot.MinutesLeft
 				}
-				ui.Box(c).Size(6, 6).Radius(999).Background(dot)
-				ui.Text(c, string(d.snapshot.State)).FontSize(11).FontWeight(600)
+				label = d.trf(c, "readyLeft", map[string]any{"left": formatMinutes(mins)})
+			case endpointAttention:
+				dot = t.Warning
+				label = d.tr(c, d.endpoint.detailKey)
+			case endpointDown:
+				dot = t.Danger
+				label = d.tr(c, d.endpoint.detailKey)
+			}
+			ui.Box(c).Size(6, 6).Radius(999).Background(dot)
+			components.Text(c, label).FontSize(11).FontWeight(600)
+		})
+		ui.Row(c).Padding(4, 10).Gap(7).Radius(999).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
+			dot := t.TextMuted
+			if d.snapshot.State == app.Recording {
+				dot = t.Danger
+			}
+			ui.Box(c).Size(6, 6).Radius(999).Background(dot)
+			components.Text(c, d.stateLabel(c, d.snapshot.State)).FontSize(11).FontWeight(600)
+		})
+	})
+}
+
+// nav builds the sidebar: app identity and the page items.
+func (d *desktop) nav(c *ui.Context) {
+	t := c.Theme()
+	ui.Column(c).Fill().Padding(sidebar.HeaderHeight(c), 0, 0, 0).Children(func() {
+		ui.Row(c).Padding(2, 16, 12, 16).Gap(10).AlignItems(ui.Center).Children(func() {
+			ui.Box(c).Size(28, 28).Radius(t.Radius).Border(1, t.Border).Center().Children(func() {
+				components.Icon(c, lucide.Mic()).Size(15, 15)
 			})
-			ui.Row(c).Padding(2).Gap(2).Radius(t.Radius).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
-				navIcons := map[string]*ui.SVG{"Record": micIcon, "History": historyIcon, "Settings": settingsIcon}
-				activePage := d.page
-				if activePage == "" {
-					activePage = "Record"
+			ui.Column(c).Gap(1).Children(func() {
+				components.Text(c, "Titen").FontSize(15).Bold()
+				components.Text(c, d.tr(c, "appSubtitle")).FontSize(10).TextColor(t.TextMuted)
+			})
+		})
+		components.Sidebar(c).Children(func() {
+			components.SidebarSection(c, d.tr(c, "navWorkspace"), func() {
+				items := []struct {
+					key   string
+					label string
+					icon  *ui.SVG
+				}{
+					{"Record", d.tr(c, "navRecord"), lucide.Mic()},
+					{"History", d.tr(c, "navHistory"), lucide.Clock()},
+					{"Settings", d.tr(c, "navSettings"), lucide.Settings()},
 				}
-				for _, page := range []string{"Record", "History", "Settings"} {
-					active := activePage == page
-					btn := ui.ButtonBase(c.Key(page)).Padding(6, 13).Gap(6).Radius(t.Radius - 2)
-					if active {
-						btn.Background(t.SurfacePressed)
-					} else if btn.Hovered() {
-						btn.Background(t.SurfaceHover)
-					} else {
-						btn.TextColor(t.TextMuted)
-					}
-					btn.Children(func() {
-						ui.Icon(c, navIcons[page]).Size(14, 14)
-						ui.Text(c, page).FontSize(12).FontWeight(map[bool]int{true: 600, false: 500}[active])
-					}).OnClick(func() {
-						if page == "History" {
+				active := d.page
+				if active == "" {
+					active = "Record"
+				}
+				for _, item := range items {
+					it := item
+					if components.SidebarItem(c, it.label, it.icon, active == it.key).Clicked() {
+						if it.key == "History" {
 							d.history()
 						} else {
-							d.page = page
+							d.page = it.key
 						}
-					})
+					}
 				}
 			})
 		})
+	})
+}
+
+// view builds the main content area: test banner, the active page and the
+// footer with status messages.
+func (d *desktop) view(c *ui.Context) {
+	c.OnShortcut(ui.Cmd, ui.KeyW, d.win.Hide)
+	t := c.Theme()
+	ui.Column(c).Fill().Padding(sidebar.HeaderHeight(c), 0, 0, 0).Children(func() {
 		if d.microphoneTesting {
 			ui.Row(c).Padding(10, 24).Gap(10).AlignItems(ui.Center).BorderWidth(0, 0, 1, 0).BorderColor(t.Border).Children(func() {
 				ui.Box(c).Size(8, 8).Radius(999).Background(t.Warning)
-				ui.Text(c, "Microphone test active").FontSize(12).FontWeight(600)
-				ui.Text(c, d.microphoneTestStatus).FontSize(12).TextColor(t.TextMuted).Grow(1).SingleLine()
-				ui.Button(c, "Stop test").OnClick(func() { d.microphoneTestCancel() })
+				components.Text(c, d.tr(c, "micTestActive")).FontSize(12).FontWeight(600)
+				components.Text(c, d.microphoneTestStatus).FontSize(12).TextColor(t.TextMuted).Grow(1).SingleLine()
+				if components.Button(c, d.tr(c, "stopTest"), components.ButtonSecondary).Clicked() {
+					d.microphoneTestCancel()
+				}
 			})
 		}
 		ui.Column(c).Grow(1).MinHeight(0).Padding(20, 24).Gap(16).Children(func() {
+			if d.audioPhase != audioReady {
+				checkColor := t.Warning
+				checkIcon := lucide.LoaderCircle()
+				if d.audioPhase == audioFailed {
+					checkColor = t.Danger
+					checkIcon = lucide.TriangleAlert()
+				}
+				ui.Column(c).FillWidth().Padding(12).Gap(8).Radius(t.Radius).Border(1, checkColor).Background(checkColor.Alpha(0.08)).Children(func() {
+					ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+						components.Icon(c, checkIcon).Size(16, 16).TextColor(checkColor)
+						components.Text(c, d.tr(c, "checkupTitle")).FontSize(13).FontWeight(600).TextColor(checkColor)
+					})
+					components.Text(c, d.audioCheck).FontSize(12)
+					ui.Row(c).Gap(8).Children(func() {
+						components.Button(c, d.tr(c, "checkupAgain"), components.ButtonSecondary).Disabled(d.audioPhase == audioChecking).OnClick(d.probe)
+						if runtime.GOOS == "darwin" {
+							components.Button(c, d.tr(c, "checkupRequestAccess"), components.ButtonSecondary).Disabled(d.audioPhase == audioChecking).OnClick(d.requestAudioAccess)
+							components.Button(c, d.tr(c, "checkupPermissions"), components.ButtonSecondary).OnClick(func() {
+								_ = mygo.Shell.OpenExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+							})
+						}
+					})
+				})
+			}
 			switch d.page {
 			case "History":
 				d.historyView(c)
@@ -272,18 +591,18 @@ func (d *desktop) view(c *ui.Context) {
 		})
 		ui.Row(c).Padding(10, 24).Gap(12).AlignItems(ui.Center).BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
 			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Icon(c, cloudIcon).Size(13, 13).TextColor(t.TextMuted)
-				ui.Text(c, d.syncStatus).FontSize(11).TextColor(t.TextMuted)
+				components.Icon(c, lucide.Cloud()).Size(13, 13).TextColor(t.TextMuted)
+				components.Text(c, d.tr(c, "localTranscriptSaved")).FontSize(11).TextColor(t.TextMuted)
 			})
 			ui.Spacer(c)
 			if d.snapshot.Error != "" {
 				ui.Row(c).Padding(3, 10).Radius(999).Border(1, t.Danger).Children(func() {
-					ui.Text(c, d.snapshot.Error).FontSize(11).FontWeight(500).TextColor(t.Danger).SingleLine()
+					components.Text(c, d.snapshot.Error).FontSize(11).FontWeight(500).TextColor(t.Danger).SingleLine()
 				})
 			}
 			if d.message != "" {
 				ui.Row(c).Padding(3, 10).Radius(999).Border(1, t.Border).Children(func() {
-					ui.Text(c, d.message).FontSize(11).FontWeight(500).SingleLine()
+					components.Text(c, d.message).FontSize(11).FontWeight(500).SingleLine()
 				})
 			}
 		})
@@ -297,98 +616,116 @@ func (d *desktop) recordView(c *ui.Context) {
 		ui.Row(c).Gap(16).AlignItems(ui.Center).Wrap().Children(func() {
 			ui.Row(c).Gap(14).AlignItems(ui.Center).Children(func() {
 				ui.Box(c).Size(46, 46).Radius(t.Radius).Border(1, t.Border).Center().Children(func() {
-					ui.Icon(c, micIcon).Size(20, 20)
+					components.Icon(c, lucide.Mic()).Size(20, 20)
 				})
 				ui.Column(c).Gap(2).Children(func() {
 					ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, string(s.State)).FontSize(13).FontWeight(600)
-						ui.Badge(c, map[bool]string{true: "Both", false: d.settings.CaptureMode}[d.settings.CaptureMode == ""])
+						components.Text(c, d.stateLabel(c, s.State)).FontSize(13).FontWeight(600)
+						components.Badge(c, d.captureLabel(c, d.settings.CaptureMode))
 					})
-					ui.Text(c, fmt.Sprintf("%02d:%02d:%02d", int(s.Duration.Hours()), int(s.Duration.Minutes())%60, int(s.Duration.Seconds())%60)).
+					components.Text(c, fmt.Sprintf("%02d:%02d:%02d", int(s.Duration.Hours()), int(s.Duration.Minutes())%60, int(s.Duration.Seconds())%60)).
 						Font("monospace").FontFeatures("tnum").FontSize(30).Bold()
 				})
 			})
 			ui.Spacer(c)
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 				if s.State == app.Idle {
-					ui.PrimaryButton(c, "Start recording").Disabled(d.busy || d.microphoneTesting).OnClick(d.start)
+					// Set disabled on the parent before constructing the styled button,
+					// so Onevra applies its disabled appearance as well as semantics.
+					ui.Row(c).Disabled(!d.canRecord()).Children(func() {
+						components.Button(c, d.tr(c, "startRecording"), components.ButtonPrimary).
+							Label(d.tr(c, "startRecording")).
+							OnClick(d.start)
+					})
 				} else {
 					if s.State == app.Recording {
-						ui.Button(c, "Pause").Disabled(d.busy).OnClick(func() { d.async(d.service.Pause) })
+						components.Button(c, d.tr(c, "pause"), components.ButtonSecondary).
+							Disabled(d.busy).
+							OnClick(func() { d.async(d.service.Pause) })
 					}
 					if s.State == app.Paused {
-						ui.PrimaryButton(c, "Resume").Disabled(d.busy).OnClick(func() { d.async(func() error { return d.service.Resume(d.root) }) })
+						components.Button(c, d.tr(c, "resume"), components.ButtonPrimary).
+							Disabled(!d.canRecord()).
+							OnClick(d.resume)
 					}
-					ui.Button(c, "Stop recording").Disabled(d.busy || s.State == app.Stopping).OnClick(d.stop)
+					components.Button(c, d.tr(c, "stopRecording"), components.ButtonSecondary).
+						Disabled(d.busy || s.State == app.Stopping).
+						OnClick(d.stop)
 				}
 			})
 		})
 		ui.Divider(c)
+		microphone := d.settings.CaptureMode != "System audio only"
+		system := d.settings.CaptureMode != "Microphone only"
+		ui.Row(c).Gap(18).Children(func() {
+			mic := components.Checkbox(c, &microphone, d.tr(c, "microphone")).Disabled(d.busy || s.State != app.Idle && s.State != app.Paused || microphone && !system)
+			if mic.Changed() {
+				d.setCaptureInputs(microphone, system)
+			}
+			sys := components.Checkbox(c, &system, d.tr(c, "systemAudio")).Disabled(d.busy || s.State != app.Idle && s.State != app.Paused || system && !microphone)
+			if sys.Changed() {
+				d.setCaptureInputs(microphone, system)
+			}
+		})
 		ui.Row(c).Gap(12).Wrap().Children(func() {
 			ui.Column(c).Grow(2).MinWidth(240).Gap(5).Children(func() {
-				ui.Text(c, "Session title").FontSize(11).FontWeight(600).TextColor(t.TextMuted)
-				ui.TextInput(c.Key("title"), &d.title).Placeholder("Meeting title").Disabled(s.State != app.Idle)
-			})
-			ui.Column(c).Grow(3).MinWidth(280).Gap(5).Children(func() {
-				ui.Text(c, "Google Doc target").FontSize(11).FontWeight(600).TextColor(t.TextMuted)
-				ui.TextInput(c.Key("start-document"), &d.documentID).Placeholder("Optional existing Google document ID authorized for this app").Disabled(s.State != app.Idle)
+				components.Text(c, d.tr(c, "sessionTitle")).FontSize(11).FontWeight(600).TextColor(t.TextMuted)
+				components.TextBox(c.Key("title"), &d.title, components.TextBoxOptions{}).
+					Placeholder(d.tr(c, "meetingTitle")).Disabled(s.State != app.Idle)
 			})
 		})
 		ui.Row(c).Gap(14).Wrap().Children(func() {
 			ui.Column(c).Grow(1).MinWidth(220).Padding(10, 14).Gap(8).Radius(t.Radius).Border(1, t.Border).Children(func() {
 				ui.Row(c).AlignItems(ui.Center).Children(func() {
-					ui.Icon(c, micIcon).Size(13, 13)
-					ui.Text(c, "Microphone").FontSize(12).FontWeight(600).MarginStart(6)
+					components.Icon(c, lucide.Mic()).Size(13, 13)
+					components.Text(c, d.tr(c, "microphone")).FontSize(12).FontWeight(600).MarginStart(6)
 					ui.Spacer(c)
-					ui.Textf(c, "%d%%", int(s.MicrophoneLevel*100+0.5)).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
+					components.Text(c, fmt.Sprintf("%d%%", int(s.MicrophoneLevel*100+0.5))).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
 				})
-				ui.Meter(c, s.MicrophoneLevel, 0, 1, levels).FillWidth().Label("Microphone level")
+				ui.Meter(c, s.MicrophoneLevel, 0, 1, levels).FillWidth().Label(d.tr(c, "microphone"))
 			})
 			ui.Column(c).Grow(1).MinWidth(220).Padding(10, 14).Gap(8).Radius(t.Radius).Border(1, t.Border).Children(func() {
 				ui.Row(c).AlignItems(ui.Center).Children(func() {
-					ui.Icon(c, speakerIcon).Size(13, 13)
-					ui.Text(c, "System audio").FontSize(12).FontWeight(600).MarginStart(6)
+					components.Icon(c, lucide.Volume2()).Size(13, 13)
+					components.Text(c, d.tr(c, "systemAudio")).FontSize(12).FontWeight(600).MarginStart(6)
 					ui.Spacer(c)
-					ui.Textf(c, "%d%%", int(s.SystemLevel*100+0.5)).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
+					components.Text(c, fmt.Sprintf("%d%%", int(s.SystemLevel*100+0.5))).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
 				})
-				ui.Meter(c, s.SystemLevel, 0, 1, levels).FillWidth().Label("System audio level")
+				ui.Meter(c, s.SystemLevel, 0, 1, levels).FillWidth().Label(d.tr(c, "systemAudio"))
 			})
 		})
 	})
 	ui.Column(c).Grow(1).MinHeight(0).Padding(18, 20).Gap(12).Radius(t.Radius).Border(1, t.Border).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "Live transcript").FontSize(16).Bold()
+			components.Text(c, d.tr(c, "liveTranscript")).FontSize(16).Bold()
 			ui.Spacer(c)
-			segWord := "segments"
-			if len(s.Segments) == 1 {
-				segWord = "segment"
-			}
-			ui.Badge(c, fmt.Sprintf("%d %s", len(s.Segments), segWord))
+			components.Badge(c, d.trf(c, "segmentsBadge", map[string]any{"count": len(s.Segments)}))
 		})
 		if len(s.Segments) == 0 && s.Partial == "" {
 			ui.Column(c).Grow(1).Center().Gap(8).Padding(24).Radius(t.Radius).Border(1, t.Border).Children(func() {
 				ui.Box(c).Size(36, 36).Radius(t.Radius).Border(1, t.Border).Center().Children(func() {
-					ui.Icon(c, docIcon).Size(16, 16)
+					components.Icon(c, lucide.FileText()).Size(16, 16)
 				})
-				ui.Text(c, "Waiting for speech").FontSize(14).FontWeight(600)
-				ui.Text(c, "Finalized speech is saved on this Mac before Google Docs sync.").FontSize(12).TextColor(t.TextMuted).TextAlign(ui.Center)
+				components.Text(c, d.tr(c, "waitingForSpeech")).FontSize(14).FontWeight(600)
+				components.Text(c, d.tr(c, "waitingDesc")).FontSize(12).TextColor(t.TextMuted).TextAlign(ui.Center)
 			})
 		}
+		rows := transcriptRows(s.Segments)
 		d.liveList.Key = func(i int) any {
-			if i < len(s.Segments) {
-				return s.Segments[i].ID
+			if i < len(rows) {
+				return rows[i].ID
 			}
 			return "partial"
 		}
-		list := ui.List(c.Key("live"), &d.liveList, len(s.Segments)+1, func(i int) {
-			if i < len(s.Segments) {
+		list := ui.List(c.Key("live"), &d.liveList, len(rows)+1, func(i int) {
+			if i < len(rows) {
 				ui.Box(c).FillWidth().Padding(3, 0).Children(func() {
-					renderSegmentRow(c, s.Segments[i])
+					renderSegmentRow(c, rows[i], d.trf(c, "speaker", map[string]any{"who": speakerOf(rows[i])}))
 				})
 			} else if s.Partial != "" {
 				ui.Row(c).FillWidth().Padding(10, 12).Gap(10).Radius(t.Radius).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
-					ui.Badge(c, "LIVE")
-					ui.Text(c, s.Partial).Grow(1).FontSize(13).Italic().TextColor(t.TextMuted)
+					components.Badge(c, d.tr(c, "liveBadge"))
+					components.Text(c, s.Partial).Grow(1).FontSize(13).Italic().TextColor(t.TextMuted)
 				})
 			} else {
 				ui.Box(c).Height(1)
@@ -399,27 +736,87 @@ func (d *desktop) recordView(c *ui.Context) {
 		}
 	})
 }
-func segmentLabel(s transcript.Segment) string {
-	return fmt.Sprintf("[%02d:%02d] Speaker %s  %s", s.StartMS/60000, s.StartMS/1000%60, s.Speaker, s.Text)
+func speakerOf(s transcript.Segment) string {
+	who := strings.TrimSpace(s.Speaker)
+	if who == "" {
+		who = "1"
+	}
+	return who
+}
+
+func transcriptRows(segments []transcript.Segment) []transcript.Segment {
+	rows := make([]transcript.Segment, 0, len(segments))
+	for _, segment := range segments {
+		if len(rows) > 0 {
+			last := &rows[len(rows)-1]
+			gap := segment.StartMS - last.EndMS
+			if speakerOf(*last) == speakerOf(segment) && gap <= 20_000 {
+				if gap > 2000 && endsSentence(last.Text) {
+					last.Text = strings.TrimSpace(last.Text) + "\n\n"
+					segment.Text = strings.TrimLeft(segment.Text, " \t")
+				}
+				last.Text += segment.Text
+				last.EndMS = segment.EndMS
+				continue
+			}
+		}
+		rows = append(rows, segment)
+	}
+	for i := range rows {
+		rows[i].Text = splitLongParagraphs(strings.TrimSpace(rows[i].Text))
+	}
+	return rows
+}
+
+func endsSentence(text string) bool {
+	text = strings.TrimSpace(text)
+	text = strings.TrimRight(text, "\"'”’)]")
+	return strings.HasSuffix(text, ".") || strings.HasSuffix(text, "!") || strings.HasSuffix(text, "?") || strings.HasSuffix(text, "…")
+}
+
+func splitLongParagraphs(text string) string {
+	var parts []string
+	for _, part := range strings.Split(text, "\n\n") {
+		for len(part) > 900 {
+			cut := strings.LastIndexAny(part[:500], ".!?…") + 1
+			if cut == 0 {
+				cut = strings.IndexAny(part[500:], ".!?…") + 501
+				if cut < 500 || cut > 750 {
+					cut = strings.LastIndex(part[:500], " ")
+				}
+			}
+			if cut <= 0 || cut >= len(part) {
+				break
+			}
+			parts = append(parts, strings.TrimSpace(part[:cut]))
+			part = strings.TrimSpace(part[cut:])
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, "\n\n")
+}
+func (d *desktop) segmentLabel(c *ui.Context, s transcript.Segment) string {
+	return fmt.Sprintf("[%02d:%02d] %s  %s", s.StartMS/60000, s.StartMS/1000%60, d.trf(c, "speaker", map[string]any{"who": speakerOf(s)}), s.Text)
 }
 func (d *desktop) historyView(c *ui.Context) {
 	t := c.Theme()
 	ui.Row(c).Grow(1).MinHeight(0).Gap(16).AlignItems(ui.Stretch).Children(func() {
 		ui.Column(c).Width(330).Shrink(0).Padding(16).Gap(12).Radius(t.Radius).Border(1, t.Border).Children(func() {
 			ui.Row(c).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "Meetings").FontSize(15).Bold()
+				components.Text(c, d.tr(c, "meetings")).FontSize(15).Bold()
 				ui.Spacer(c)
-				ui.Badge(c, fmt.Sprintf("%d", len(d.meetings)))
+				components.Badge(c, fmt.Sprintf("%d", len(d.meetings)))
 			})
 			ui.Row(c).Gap(6).Children(func() {
-				ui.TextInput(c.Key("search"), &d.search).Placeholder("Search meetings and transcripts").Grow(1)
-				ui.Button(c, "Search").Disabled(d.busy).OnClick(d.history)
+				components.TextBox(c, &d.search, components.TextBoxOptions{}).
+					Placeholder(d.tr(c, "searchPlaceholder")).Grow(1)
+				components.Button(c, d.tr(c, "search"), components.ButtonSecondary).Disabled(d.busy).OnClick(d.history)
 			})
 			ui.Scroll(c.Key("meetings")).Grow(1).Gap(6).Children(func() {
 				if len(d.meetings) == 0 {
 					ui.Column(c).Padding(20, 12).Gap(4).Center().Children(func() {
-						ui.Text(c, "No meetings found").FontSize(13).FontWeight(600)
-						ui.Text(c, "Start a recording or clear the search query.").FontSize(11).TextColor(t.TextMuted).TextAlign(ui.Center)
+						components.Text(c, d.tr(c, "noMeetings")).FontSize(13).FontWeight(600)
+						components.Text(c, d.tr(c, "noMeetingsDesc")).FontSize(11).TextColor(t.TextMuted).TextAlign(ui.Center)
 					})
 				}
 				for _, m := range d.meetings {
@@ -430,17 +827,17 @@ func (d *desktop) historyView(c *ui.Context) {
 					} else if row.Hovered() {
 						row.Background(t.SurfaceHover)
 					}
-					row.Children(func() {
+					row.Label(m.Title).Children(func() {
 						ui.Column(c).Grow(1).Gap(4).AlignItems(ui.Start).Children(func() {
-							ui.Text(c, m.Title).FontSize(13).FontWeight(600).SingleLine()
+							components.Text(c, m.Title).FontSize(13).FontWeight(600).SingleLine()
 							meta := m.CreatedAt.Format("Jan 2, 2006 · 15:04")
 							if m.CreatedAt.IsZero() {
-								meta = "Saved locally"
+								meta = d.tr(c, "savedLocally")
 							}
 							ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-								ui.Text(c, meta).FontSize(11).TextColor(t.TextMuted)
+								components.Text(c, meta).FontSize(11).TextColor(t.TextMuted)
 								if m.DocumentID != "" {
-									ui.Badge(c, "Synced")
+									components.Badge(c, d.tr(c, "synced"))
 								}
 							})
 						})
@@ -458,66 +855,44 @@ func (d *desktop) historyView(c *ui.Context) {
 			}
 			ui.Row(c).Gap(10).AlignItems(ui.Center).Wrap().Children(func() {
 				ui.Column(c).Grow(1).Gap(2).Children(func() {
-					heading := "Transcript reader"
-					sub := "Select a meeting on the left to inspect its transcript or link a Google Doc."
+					heading := d.tr(c, "transcriptReader")
+					sub := d.tr(c, "selectMeeting")
 					if activeMeeting != nil {
 						heading = activeMeeting.Title
-						sub = fmt.Sprintf("%d finalized segments", len(d.detail))
+						sub = d.trf(c, "finalizedSegments", map[string]any{"count": len(d.detail)})
 					} else if d.selected != "" {
-						sub = fmt.Sprintf("Meeting %s · %d segments", d.selected, len(d.detail))
+						sub = d.trf(c, "meetingSegments", map[string]any{"id": d.selected, "count": len(d.detail)})
 					}
-					ui.Text(c, heading).FontSize(16).Bold().SingleLine()
-					ui.Text(c, sub).FontSize(12).TextColor(t.TextMuted)
+					components.Text(c, heading).FontSize(16).Bold().SingleLine()
+					components.Text(c, sub).FontSize(12).TextColor(t.TextMuted)
 				})
-				ui.Button(c, "Copy transcript").Disabled(d.selected == "").OnClick(func() {
+				components.Button(c, d.tr(c, "copyTranscript"), components.ButtonSecondary).Disabled(d.selected == "").OnClick(func() {
 					var b strings.Builder
 					for _, s := range d.detail {
-						b.WriteString(segmentLabel(s) + "\n")
+						b.WriteString(d.segmentLabel(c, s) + "\n")
 					}
 					c.Services().WriteClipboard(b.String())
 				})
-				ui.Button(c, "Open Google Doc").Disabled(d.selected == "").OnClick(func() {
-					for _, m := range d.meetings {
-						if m.ID == d.selected && m.DocumentID != "" {
-							if err := mygo.Shell.OpenExternal("https://docs.google.com/document/d/" + m.DocumentID + "/edit"); err != nil {
-								d.message = err.Error()
-							}
-							return
-						}
+				components.Button(c, d.tr(c, "openTitenMeeting"), components.ButtonSecondary).Disabled(activeMeeting == nil || activeMeeting.CloudMeetingID == "").OnClick(func() {
+					if activeMeeting != nil {
+						_ = mygo.Shell.OpenExternal(activeMeeting.CloudEndpoint + "/meetings/" + activeMeeting.CloudMeetingID)
 					}
-					d.message = "This meeting has no associated Google Doc"
 				})
 			})
 			ui.Divider(c)
 			ui.Scroll(c.Key("detail")).Grow(1).FillWidth().Gap(8).Children(func() {
 				if len(d.detail) == 0 {
 					ui.Column(c).Grow(1).Padding(32, 16).Center().Gap(6).Radius(t.Radius).Border(1, t.Border).Children(func() {
-						ui.Icon(c, docIcon).Size(20, 20).TextColor(t.TextMuted)
-						ui.Text(c, "No transcript segments displayed").FontSize(13).FontWeight(600)
-						ui.Text(c, "Choose a recorded meeting from the sidebar to read or copy its speech.").FontSize(12).TextColor(t.TextMuted)
+						components.Icon(c, lucide.FileText()).Size(20, 20).TextColor(t.TextMuted)
+						components.Text(c, d.tr(c, "noSegments")).FontSize(13).FontWeight(600)
+						components.Text(c, d.tr(c, "noSegmentsDesc")).FontSize(12).TextColor(t.TextMuted)
 					})
 				}
-				for _, s := range d.detail {
-					renderSegmentRow(c, s)
+				for _, s := range transcriptRows(d.detail) {
+					renderSegmentRow(c, s, d.trf(c, "speaker", map[string]any{"who": speakerOf(s)}))
 				}
 			})
-			ui.Row(c).Padding(12).Gap(10).Radius(t.Radius).Border(1, t.Border).AlignItems(ui.Center).Wrap().Children(func() {
-				ui.Icon(c, docIcon).Size(15, 15).TextColor(t.TextMuted)
-				ui.TextInput(c.Key("document"), &d.documentID).Placeholder("Existing Google document ID").Grow(1).MinWidth(200)
-				ui.Button(c, "Use document for selected meeting").Disabled(d.selected == "" || d.busy).OnClick(func() {
-					meeting, id := d.selected, strings.TrimSpace(d.documentID)
-					if id == "" {
-						d.message = "Enter a document ID"
-						return
-					}
-					d.async(func() error {
-						if err := d.docs.CheckDocument(d.root, id); err != nil {
-							return err
-						}
-						return d.store.SetDocument(d.root, meeting, id)
-					})
-				})
-			})
+
 		})
 	})
 }
@@ -525,114 +900,169 @@ func (d *desktop) settingsView(c *ui.Context) {
 	t := c.Theme()
 	ui.Scroll(c.Key("settings")).Grow(1).FillWidth().Gap(16).Children(func() {
 		ui.Row(c).Padding(12, 16).Gap(12).Radius(t.Radius).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
-			ui.Icon(c, keyIcon).Size(16, 16).TextColor(t.TextMuted)
-			ui.Text(c, "Credentials stay in "+platform.CredentialStore(runtime.GOOS)+". Transcripts stay on this device.").FontSize(12).FontWeight(500).Grow(1)
-			ui.PrimaryButton(c, "Save settings").Disabled(d.busy || d.microphoneTesting || d.snapshot.State != app.Idle && d.snapshot.State != app.Paused).OnClick(d.save)
+			components.Icon(c, lucide.KeyRound()).Size(16, 16).TextColor(t.TextMuted)
+			components.Text(c, d.trf(c, "tokenNote", map[string]any{"store": platform.CredentialStore(runtime.GOOS)})).FontSize(12).FontWeight(500).Grow(1)
+			components.Button(c, d.tr(c, "saveSettings"), components.ButtonPrimary).Disabled(d.busy || d.microphoneTesting || d.snapshot.State != app.Idle && d.snapshot.State != app.Paused).OnClick(d.save)
+			components.Button(c, d.tr(c, "openLogs"), components.ButtonSecondary).OnClick(func() {
+				mygo.Shell.ShowItemInFolder(filepath.Join(d.dir, "logs", "titen.log"))
+			})
 		})
 		ui.Row(c).Gap(16).AlignItems(ui.Stretch).Wrap().Children(func() {
 			surfaceCard(c, func() {
-				cardHeader(c, keyIcon, "Cloud & Authentication", "Soniox speech recognition and Google Docs OAuth credentials.")
+				cardHeader(c, lucide.KeyRound(), d.tr(c, "accountTitle"), d.tr(c, "accountDesc"))
 				ui.Divider(c)
 				ui.Column(c).Gap(5).Children(func() {
-					ui.Text(c, "Soniox API key").FontSize(12).FontWeight(600)
-					ui.TextInput(c.Key("key"), &d.key).Password().Placeholder("Enter a key to replace the saved key")
-				})
-				ui.Column(c).Gap(5).Children(func() {
-					ui.Text(c, "Google desktop OAuth client ID").FontSize(12).FontWeight(600)
-					ui.TextInput(c.Key("google-client"), &d.settings.GoogleClientID)
-				})
-				ui.Column(c).Gap(5).Children(func() {
-					ui.Text(c, "Google desktop OAuth client secret").FontSize(12).FontWeight(600)
-					ui.TextInput(c.Key("google-secret"), &d.googleSecret).Password().Placeholder("Saved to Keychain for this client ID")
+					components.Text(c, d.tr(c, "serverEndpoint")).FontSize(12).FontWeight(600)
+					components.TextBox(c.Key("server-endpoint"), &d.endpointInput, components.TextBoxOptions{}).Placeholder("http://localhost:3000")
+					components.Text(c, d.tr(c, "endpointHint")).FontSize(11).TextColor(t.TextMuted)
 				})
 				ui.Row(c).Gap(10).AlignItems(ui.Center).Wrap().Children(func() {
-					ui.Button(c, "Connect Google").Disabled(d.busy || d.snapshot.State != app.Idle).OnClick(func() {
-						id := d.settings.GoogleClientID
-						d.replaceGoogle(id)
-						g := d.currentGoogle()
-						d.async(func() error {
-							ctx, cancel := context.WithTimeout(d.root, 3*time.Minute)
-							defer cancel()
-							return g.Connect(ctx)
-						})
-					})
-					ui.Text(c, "Save settings before connecting.").FontSize(12).TextColor(t.TextMuted)
+					components.Button(c, d.tr(c, "signInBrowser"), components.ButtonSecondary).Disabled(d.busy || d.snapshot.State != app.Idle).OnClick(d.connectAccount)
+					status := d.tr(c, "notSignedIn")
+					if d.deviceToken != "" {
+						status = d.tr(c, "signedIn")
+					}
+					components.Text(c, status).FontSize(12).TextColor(t.TextMuted)
 				})
-				ui.Divider(c)
+				if d.deviceCode != "" {
+					components.Text(c, d.trf(c, "approveCode", map[string]any{"code": d.deviceCode})).FontSize(13).FontWeight(600)
+				}
+				components.Button(c, d.tr(c, "openBilling"), components.ButtonSecondary).OnClick(func() { _ = mygo.Shell.OpenExternal(d.settings.ServerEndpoint + "/billing") })
+				components.Button(c, d.tr(c, "googleSettings"), components.ButtonSecondary).OnClick(func() { _ = mygo.Shell.OpenExternal(d.settings.ServerEndpoint + "/settings") })
 				ui.Column(c).Gap(5).Children(func() {
-					ui.Text(c, "Language hints, separated by commas").FontSize(12).FontWeight(600)
-					ui.TextInput(c.Key("languages"), &d.settings.Languages)
+					components.Text(c, d.tr(c, "language")).FontSize(12).FontWeight(600)
+					sel := components.NativeSelect(c, &d.settings.Language, []components.NativeSelectOption[string]{
+						{Value: locales.System, Label: d.tr(c, "langSystem")},
+						{Value: locales.English, Label: "English"},
+						{Value: locales.Indonesian, Label: "Bahasa Indonesia"},
+					})
+					sel.Trigger.FillWidth().Label(d.tr(c, "language"))
+					if sel.Changed() {
+						d.applyLanguage()
+						d.refreshLocale()
+						cfg := d.settings
+						d.tasks.Add(1)
+						go func() {
+							defer d.tasks.Done()
+							if err := app.SaveSettings(d.dir, cfg); err != nil {
+								d.win.Update(func() { d.message = err.Error() })
+							}
+						}()
+					}
 				})
-				ui.Checkbox(c.Key("auto-sync"), &d.settings.AutoSync, "Create a Google Doc when recording starts")
 			}).Grow(1).Basis(380).MinWidth(320)
 
 			surfaceCard(c, func() {
-				cardHeader(c, micIcon, "Audio & Capture Hardware", "Select inputs, verify signal levels, and configure the native helper.")
+				cardHeader(c, lucide.Mic(), d.tr(c, "audioTitle"), d.tr(c, "audioDesc"))
 				ui.Divider(c)
 				ui.Column(c).Gap(6).Children(func() {
 					ui.Row(c).AlignItems(ui.Center).Children(func() {
-						ui.Text(c, "Microphone").FontSize(12).FontWeight(600)
+						components.Text(c, d.tr(c, "microphone")).FontSize(12).FontWeight(600)
 						ui.Spacer(c)
-						ui.Button(c, "Refresh microphones").Disabled(d.busy || d.microphoneTesting).OnClick(d.refreshDevices)
+						components.Button(c, d.tr(c, "refreshMics"), components.ButtonSecondary).Disabled(d.busy || d.microphoneTesting).OnClick(d.refreshDevices)
 					})
-					options := []string{"System default"}
-					for _, device := range d.devices {
-						options = append(options, deviceLabel(device))
+					options := []components.NativeSelectOption[string]{
+						{Value: "System default", Label: d.tr(c, "systemDefault")},
 					}
-					ui.Select(c.Key("microphone"), &d.microphone, options).FillWidth()
+					for _, device := range d.devices {
+						options = append(options, components.NativeSelectOption[string]{Value: deviceLabel(device), Label: deviceLabel(device)})
+					}
+					components.NativeSelect(c.Key("microphone"), &d.microphone, options).Trigger.FillWidth().Label(d.tr(c, "microphone"))
 				})
 				ui.Column(c).Padding(12).Gap(8).Radius(t.Radius).Border(1, t.Border).Children(func() {
 					ui.Row(c).Gap(10).AlignItems(ui.Center).Wrap().Children(func() {
 						if d.microphoneTesting {
-							ui.Button(c, "Stop microphone test").OnClick(func() { d.microphoneTestCancel() })
+							components.Button(c, d.tr(c, "stopMicTest"), components.ButtonSecondary).OnClick(func() { d.microphoneTestCancel() })
 						} else {
-							ui.Button(c, "Test microphone for 10 seconds").Disabled(d.busy || d.snapshot.State != app.Idle).OnClick(d.testMicrophone)
+							components.Button(c, d.tr(c, "testMic"), components.ButtonSecondary).Disabled(d.busy || d.snapshot.State != app.Idle).OnClick(d.testMicrophone)
 						}
-						ui.Meter(c, d.microphoneTestLevel, 0, 1, &ui.MeterLevels{Warning: 0.75, Critical: 0.92}).Grow(1).MinWidth(140).Label("Microphone test level")
+						ui.Meter(c, d.microphoneTestLevel, 0, 1, &ui.MeterLevels{Warning: 0.75, Critical: 0.92}).Grow(1).MinWidth(140).Label(d.tr(c, "testMic"))
 					})
 					if d.microphoneTestStatus != "" {
-						ui.Text(c, d.microphoneTestStatus).FontSize(12).FontWeight(500)
+						components.Text(c, d.microphoneTestStatus).FontSize(12).FontWeight(500)
 					}
-					ui.Text(c, "This test stays on your Mac. It does not create a meeting or contact Soniox.").FontSize(11).TextColor(t.TextMuted)
+					components.Text(c, d.tr(c, "micTestNote")).FontSize(11).TextColor(t.TextMuted)
 				})
 				ui.Column(c).Gap(5).Children(func() {
-					ui.Text(c, "Audio sources").FontSize(12).FontWeight(600)
-					ui.Select(c.Key("capture-mode"), &d.settings.CaptureMode, []string{"Both", "Microphone only", "System audio only"}).FillWidth()
+					components.Text(c, d.tr(c, "audioSources")).FontSize(12).FontWeight(600)
+					components.NativeSelect(c.Key("capture-mode"), &d.settings.CaptureMode, []components.NativeSelectOption[string]{
+						{Value: "Both", Label: d.tr(c, "captureBoth")},
+						{Value: "Microphone only", Label: d.tr(c, "captureMic")},
+						{Value: "System audio only", Label: d.tr(c, "captureSystem")},
+					}).Trigger.FillWidth().Label(d.tr(c, "audioSources"))
 				})
 				ui.Column(c).Gap(5).Children(func() {
-					ui.Text(c, "Audio helper executable").FontSize(12).FontWeight(600)
-					ui.TextInput(c.Key("helper"), &d.settings.HelperPath)
+					components.Text(c, d.tr(c, "helperExe")).FontSize(12).FontWeight(600)
+					components.TextBox(c.Key("helper"), &d.settings.HelperPath, components.TextBoxOptions{}).Label(d.tr(c, "helperExe"))
 				})
-				ui.Text(c, "Use headphones to reduce duplicate speech from microphone echo. Pause before changing capture settings.").FontSize(11).TextColor(t.TextMuted)
+				components.Text(c, d.tr(c, "headphonesNote")).FontSize(11).TextColor(t.TextMuted)
 			}).Grow(1).Basis(380).MinWidth(320)
 		})
 	})
 }
 
+func (d *desktop) menu() *mygo.Menu {
+	return mygo.NewMenu([]*mygo.MenuItem{
+		{Label: locales.T("menuOpen"), Click: func(*mygo.MenuItem, *mygo.Window) { d.win.Show(); d.win.Focus() }},
+		{ID: "start", Label: locales.T("menuStart"), Click: func(*mygo.MenuItem, *mygo.Window) { d.start() }},
+		{ID: "pause", Label: locales.T("menuPause"), Click: func(*mygo.MenuItem, *mygo.Window) { d.async(d.service.Pause) }},
+		{ID: "resume", Label: locales.T("menuResume"), Click: func(*mygo.MenuItem, *mygo.Window) { d.resume() }},
+		{ID: "stop", Label: locales.T("menuStop"), Click: func(*mygo.MenuItem, *mygo.Window) { d.stop() }},
+		mygo.Separator(), {Label: locales.T("menuQuit"), Click: func(*mygo.MenuItem, *mygo.Window) { mygo.App.Quit() }},
+	})
+}
+
+func (d *desktop) syncTrayMenu() {
+	if d.trayMenu == nil {
+		return
+	}
+	d.trayMenu.ItemByID("start").SetEnabled(d.canRecord() && d.snapshot.State == app.Idle)
+	d.trayMenu.ItemByID("pause").SetEnabled(!d.busy && d.snapshot.State == app.Recording)
+	d.trayMenu.ItemByID("resume").SetEnabled(d.canRecord() && d.snapshot.State == app.Paused)
+	d.trayMenu.ItemByID("stop").SetEnabled(!d.busy && (d.snapshot.State == app.Recording || d.snapshot.State == app.Paused))
+}
+
 func (d *desktop) ready() {
-	d.win = mygo.NewWindow(mygo.WindowOptions{Title: "Titen", Width: 1000, Height: 760, MinWidth: 720, MinHeight: 560, StateKey: "main", Content: ui.View(d.view)})
+	d.shell = sidebar.NewShell(sidebar.ShellOptions{
+		Title:    locales.T("appTitle"),
+		Width:    1000,
+		Height:   760,
+		MinWidth: 720, MinHeight: 560,
+		StateKey:     "main",
+		LeftWidth:    220,
+		Left:         d.nav,
+		Content:      d.view,
+		ContentTitle: d.titlebar,
+	})
+	d.win = d.shell.Window()
 	d.win.OnClose(func(e *mygo.CloseEvent) {
 		if !d.quitting {
 			e.PreventDefault()
 			d.win.Hide()
 		}
 	})
-	menu := mygo.NewMenu([]*mygo.MenuItem{
-		{Label: "Open Titen", Click: func(*mygo.MenuItem, *mygo.Window) { d.win.Show(); d.win.Focus() }},
-		{Label: "Start recording", Click: func(*mygo.MenuItem, *mygo.Window) { d.start() }},
-		{Label: "Pause recording", Click: func(*mygo.MenuItem, *mygo.Window) { d.async(d.service.Pause) }},
-		{Label: "Resume recording", Click: func(*mygo.MenuItem, *mygo.Window) { d.async(func() error { return d.service.Resume(d.root) }) }},
-		{Label: "Stop recording", Click: func(*mygo.MenuItem, *mygo.Window) { d.stop() }},
-		mygo.Separator(), {Label: "Quit Titen", Click: func(*mygo.MenuItem, *mygo.Window) { mygo.App.Quit() }},
-	})
 	var err error
-	d.tray, err = mygo.NewTray(mygo.TrayOptions{Icon: trayIcon(), IconIsTemplate: true, ToolTip: "Titen · Ready", Menu: menu})
+	d.trayMenu = d.menu()
+	d.syncTrayMenu()
+	d.tray, err = mygo.NewTray(mygo.TrayOptions{Icon: trayIcon(), IconIsTemplate: true, ToolTip: locales.Tf("tipPrefix", map[string]any{"state": locales.T("state.Ready")}), Menu: d.trayMenu})
 	if err != nil {
-		d.message = "Menu bar unavailable. " + err.Error()
+		d.message = locales.T("menuBarUnavailable") + " " + err.Error()
 	}
-	worker := docsync.Worker{Store: d.store, Docs: d.docs, OnStatus: func(status string) { d.win.Update(func() { d.syncStatus = status }) }}
+	d.probe()
 	d.tasks.Add(1)
-	go func() { defer d.tasks.Done(); worker.Run(d.root) }()
+	go func() {
+		defer d.tasks.Done()
+		beat := time.NewTicker(5 * time.Minute)
+		defer beat.Stop()
+		for {
+			select {
+			case <-d.root.Done():
+				return
+			case <-beat.C:
+				d.win.Update(d.probe)
+			}
+		}
+	}()
 	d.tasks.Add(1)
 	go func() {
 		defer d.tasks.Done()
@@ -647,10 +1077,14 @@ func (d *desktop) ready() {
 				d.win.Update(func() {
 					d.snapshot = s
 					if d.tray != nil {
+						if ready := d.canRecord(); ready != d.trayCanRecord || s.State != d.trayState {
+							d.trayCanRecord, d.trayState = ready, s.State
+							d.syncTrayMenu()
+						}
 						if d.microphoneTesting {
-							d.tray.SetToolTip("Titen · Microphone test active")
+							d.tray.SetToolTip(locales.T("tipMicTest"))
 						} else {
-							d.tray.SetToolTip("Titen · " + string(s.State))
+							d.tray.SetToolTip(locales.Tf("tipPrefix", map[string]any{"state": locales.T("state." + string(s.State))}))
 						}
 					}
 				})
@@ -663,7 +1097,7 @@ func (d *desktop) ready() {
 		}
 		e.PreventDefault()
 		if d.busy {
-			d.message = "Wait for the current operation before quitting"
+			d.message = locales.T("waitBeforeQuit")
 			d.win.Show()
 			return
 		}
@@ -711,6 +1145,20 @@ func main() {
 		slog.Error("create config directory", "error", err)
 		os.Exit(1)
 	}
+	logDir := filepath.Join(dir, "logs")
+	if err = os.MkdirAll(logDir, 0700); err != nil {
+		slog.Error("create log directory", "error", err)
+	} else {
+		logPath := filepath.Join(logDir, "titen.log")
+		logFile, logErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if logErr != nil {
+			slog.Error("open log file", "error", logErr)
+		} else {
+			defer logFile.Close()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(io.MultiWriter(os.Stderr, logFile), nil)))
+			slog.Info("logging initialized", "path", logPath)
+		}
+	}
 	cfg, err := app.LoadSettings(dir)
 	if err != nil {
 		slog.Error("settings", "error", err)
@@ -730,13 +1178,14 @@ func main() {
 	defer store.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	google := &auth.Google{ClientID: cfg.GoogleClientID, ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"), ClientSecretLookup: func() (string, error) { return auth.GetSecret("google-client-secret/" + cfg.GoogleClientID) }, OpenBrowser: mygo.Shell.OpenExternal}
-	d := &desktop{service: app.NewService(store), store: store, dir: dir, settings: cfg, page: "Record", syncStatus: "Google Docs sync idle", root: ctx, cancel: cancel, microphone: "System default", google: google}
-	d.docs = &docsync.GoogleDocs{Token: func(ctx context.Context) (string, error) { return d.currentGoogle().Token(ctx) }}
+	endpoint := cfg.ServerEndpoint
+	token, _ := auth.GetSecret(saas.TokenKey(endpoint))
+	d := &desktop{service: app.NewService(store), store: store, dir: dir, settings: cfg, endpointInput: endpoint, deviceToken: token, page: "Record", root: ctx, cancel: cancel, microphone: "System default"}
 	d.liveList.FollowEnd = true
 	if cfg.MicrophoneID != "" {
 		d.microphone = cfg.MicrophoneID
 	}
+	d.applyLanguage()
 	slog.Info("starting Titen", "version", version, "os", runtime.GOOS, "arch", runtime.GOARCH)
 	mygo.App.SetName("Titen")
 	mygo.App.OnWindowAllClosed(func() {})
@@ -750,21 +1199,6 @@ func main() {
 	}
 }
 
-var (
-	micIcon      = svgIcon(`<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/><path d="M8 22h8"/>`)
-	historyIcon  = svgIcon(`<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>`)
-	settingsIcon = svgIcon(`<circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>`)
-	speakerIcon  = svgIcon(`<path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>`)
-	docIcon      = svgIcon(`<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h6"/>`)
-	copyIcon     = svgIcon(`<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>`)
-	keyIcon      = svgIcon(`<circle cx="7.5" cy="15.5" r="4.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/>`)
-	cloudIcon    = svgIcon(`<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>`)
-)
-
-func svgIcon(shapes string) *ui.SVG {
-	return ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` + shapes + `</svg>`))
-}
-
 func surfaceCard(c *ui.Context, body func()) ui.Element {
 	t := c.Theme()
 	return ui.Column(c).Padding(20).Gap(14).Radius(t.Radius).Border(1, t.Border).Children(body)
@@ -775,32 +1209,28 @@ func cardHeader(c *ui.Context, icon *ui.SVG, title, subtitle string) {
 	ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 		if icon != nil {
 			ui.Box(c).Size(30, 30).Radius(t.Radius).Border(1, t.Border).Center().Children(func() {
-				ui.Icon(c, icon).Size(15, 15)
+				components.Icon(c, icon).Size(15, 15)
 			})
 		}
 		ui.Column(c).Grow(1).Gap(2).Children(func() {
-			ui.Text(c, title).FontSize(15).FontWeight(600)
+			components.Text(c, title).FontSize(15).FontWeight(600)
 			if subtitle != "" {
-				ui.Text(c, subtitle).FontSize(12).TextColor(t.TextMuted)
+				components.Text(c, subtitle).FontSize(12).TextColor(t.TextMuted)
 			}
 		})
 	})
 }
 
-func renderSegmentRow(c *ui.Context, s transcript.Segment) {
+func renderSegmentRow(c *ui.Context, s transcript.Segment, speaker string) {
 	t := c.Theme()
 	stamp := fmt.Sprintf("%02d:%02d", s.StartMS/60000, s.StartMS/1000%60)
-	who := strings.TrimSpace(s.Speaker)
-	if who == "" {
-		who = "1"
-	}
 	ui.Row(c).FillWidth().Padding(10, 12).Gap(12).Radius(t.Radius).Border(1, t.Border).AlignItems(ui.Start).Children(func() {
 		ui.Box(c).Padding(2, 7).Radius(t.Radius-2).Border(1, t.Border).Shrink(0).Children(func() {
-			ui.Text(c, stamp).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
+			components.Text(c, stamp).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
 		})
-		ui.Badge(c, "Speaker "+who)
-		ui.Text(c, s.Text).Grow(1).FontSize(13).LineHeight(1.45).
-			Label(segmentLabel(s))
+		components.Badge(c, speaker)
+		components.Text(c, s.Text).Grow(1).FontSize(13).LineHeight(1.45).
+			Label(stamp + " " + speaker)
 	})
 }
 
@@ -824,7 +1254,7 @@ func (d *desktop) testMicrophone() {
 	d.microphoneTestCancel = cancel
 	d.microphoneTesting = true
 	d.microphoneTestLevel = 0
-	d.microphoneTestStatus = "Speak into the selected microphone. Testing for up to 10 seconds."
+	d.microphoneTestStatus = locales.T("micTestSpeak")
 	d.tasks.Add(1)
 	go func() {
 		defer d.tasks.Done()
@@ -838,9 +1268,9 @@ func (d *desktop) testMicrophone() {
 			case err != nil:
 				d.microphoneTestStatus = err.Error()
 			case result.Peak < 0.01:
-				d.microphoneTestStatus = "Microphone test finished. No clear signal detected. Check the selected input and speak closer to it."
+				d.microphoneTestStatus = locales.T("micTestNoSignal")
 			default:
-				d.microphoneTestStatus = "Microphone test finished. Input signal detected."
+				d.microphoneTestStatus = locales.T("micTestSignal")
 			}
 		})
 	}()

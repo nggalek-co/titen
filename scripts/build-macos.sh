@@ -35,8 +35,12 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 plutil -lint "$bundle/Contents/Info.plist"
-codesign --force --sign - "$bundle/Contents/MacOS/titen-audio"
-codesign --force --sign - "$bundle"
+signing_identity="${TITEN_CODESIGN_IDENTITY:--}"
+if [ "$signing_identity" = - ]; then
+  echo "Using ad hoc signing. macOS permissions may require approval again after rebuilding." >&2
+fi
+codesign --force --sign "$signing_identity" --identifier co.nggalek.titen.audio "$bundle/Contents/MacOS/titen-audio"
+codesign --force --sign "$signing_identity" "$bundle"
 codesign --verify --deep --strict "$bundle"
 echo "Built $bundle"
 

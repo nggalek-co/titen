@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import ScreenCaptureKit
 import CoreMedia
+import CoreGraphics
 import Darwin
 
 func report(_ message: String) {
@@ -175,9 +176,63 @@ final class StopGate: @unchecked Sendable {
     }
 }
 
+struct PermissionStatus: Encodable {
+    let microphone: Bool
+    let microphoneStatus: String
+    let systemAudio: Bool
+    let systemAudioStatus: String
+    let systemAudioError: String?
+}
+
 @main struct AudioMain {
     static func main() async {
         signal(SIGPIPE, SIG_IGN)
+        if CommandLine.arguments.contains("--check-permissions") || CommandLine.arguments.contains("--request-permissions") {
+            let request = CommandLine.arguments.contains("--request-permissions")
+            if request {
+                if !CommandLine.arguments.contains("--system-only") {
+                    _ = await AVCaptureDevice.requestAccess(for: .audio)
+                }
+                if !CommandLine.arguments.contains("--microphone-only") {
+                    _ = CGRequestScreenCaptureAccess()
+                }
+            }
+            let status = AVCaptureDevice.authorizationStatus(for: .audio)
+            let microphone = status == .authorized
+            // Check the same API used by Capture.start. A Core Graphics
+            // preflight failure alone is not proof that ScreenCaptureKit is denied.
+            var systemAudio = CGPreflightScreenCaptureAccess()
+            var systemAudioError: String?
+            if !CommandLine.arguments.contains("--microphone-only") {
+                do {
+                    _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                    systemAudio = true
+                } catch {
+                    systemAudio = false
+                    let failure = error as NSError
+                    systemAudioError = "\(failure.domain) (\(failure.code)): \(failure.localizedDescription)"
+                }
+            }
+            let microphoneStatus: String
+            switch status {
+            case .authorized: microphoneStatus = "authorized"
+            case .denied: microphoneStatus = "denied"
+            case .restricted: microphoneStatus = "restricted"
+            case .notDetermined: microphoneStatus = "notDetermined"
+            @unknown default: microphoneStatus = "unknown"
+            }
+            let result = PermissionStatus(
+                microphone: microphone,
+                microphoneStatus: microphoneStatus,
+                systemAudio: systemAudio,
+                systemAudioStatus: systemAudio ? "authorized" : "notAuthorized",
+                systemAudioError: systemAudioError
+            )
+            if let data = try? JSONEncoder().encode(result) {
+                FileHandle.standardOutput.write(data)
+            }
+            return
+        }
         if CommandLine.arguments.contains("--list-devices") {
             let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external], mediaType: .audio, position: .unspecified)
             let devices = discovery.devices.map { ["id": $0.uniqueID, "name": $0.localizedName] }
@@ -213,6 +268,8 @@ final class StopGate: @unchecked Sendable {
                 try await Task.sleep(nanoseconds: 1_000_000_000)
             }
         } catch {
+            let nativeError = error as NSError
+            report("Audio capture error: domain=\(nativeError.domain) code=\(nativeError.code) description=\(nativeError.localizedDescription)")
             if args.contains("--microphone-only") {
                 report("Microphone test failed. \(error.localizedDescription)")
             } else {

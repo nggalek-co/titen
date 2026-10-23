@@ -3,8 +3,11 @@ package app
 import (
 	"context"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"titen/internal/saas"
 	"titen/internal/storage"
 	"titen/internal/testhelper"
 	"titen/internal/transcript"
@@ -179,5 +182,56 @@ func TestCaptureInterruptionRecoversSameMeeting(t *testing.T) {
 	}
 	if err := s.Stop(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHeartbeatStopsOnExhaustedCredit(t *testing.T) {
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{})
+	var calls atomic.Int32
+	s.beatInterval = 10 * time.Millisecond
+	s.beat = func(ctx context.Context, sessionID string) (saas.Heartbeat, error) {
+		if calls.Add(1) == 1 {
+			return saas.Heartbeat{OK: true, MinutesLeft: 42}, nil
+		}
+		return saas.Heartbeat{OK: false, Reason: "insufficient_funds"}, nil
+	}
+	ctx := context.Background()
+	if err := s.Start(ctx, cfg, "key", "meeting"); err != nil {
+		t.Fatal(err)
+	}
+	awaitIdle(t, s)
+	snap := s.Snapshot()
+	if !strings.Contains(snap.Error, "credit") {
+		t.Fatalf("snapshot=%+v", snap)
+	}
+}
+
+func TestHeartbeatSurvivesTransientFailure(t *testing.T) {
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{})
+	var calls atomic.Int32
+	s.beatInterval = 10 * time.Millisecond
+	s.beat = func(ctx context.Context, sessionID string) (saas.Heartbeat, error) {
+		if calls.Add(1) == 1 {
+			return saas.Heartbeat{}, context.DeadlineExceeded
+		}
+		return saas.Heartbeat{OK: true, MinutesLeft: 42}, nil
+	}
+	ctx := context.Background()
+	if err := s.Start(ctx, cfg, "key", "meeting"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.Snapshot().MinutesKnown {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := s.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	snap := s.Snapshot()
+	if snap.Error != "" {
+		t.Fatalf("transient heartbeat failure surfaced as an error: %+v", snap)
 	}
 }

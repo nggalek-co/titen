@@ -16,6 +16,8 @@ import (
 )
 
 type Meeting struct {
+	CloudEndpoint    string     `json:"cloudEndpoint,omitempty"`
+	CloudMeetingID   string     `json:"cloudMeetingId,omitempty"`
 	ID               string     `json:"id"`
 	Title            string     `json:"title"`
 	CreatedAt        time.Time  `json:"createdAt"`
@@ -133,6 +135,16 @@ func (s *Store) FinishMeeting(ctx context.Context, id string) error {
 	}
 	now := time.Now()
 	m.EndedAt = &now
+	return s.update(m)
+}
+func (s *Store) SetCloudMeeting(ctx context.Context, id, endpoint, remoteID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.meeting(id)
+	if err != nil {
+		return err
+	}
+	m.CloudEndpoint, m.CloudMeetingID = endpoint, remoteID
 	return s.update(m)
 }
 func (s *Store) SetDocument(ctx context.Context, id, doc string) error {
