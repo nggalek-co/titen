@@ -234,6 +234,8 @@ func TestStreamAudioThenEnd(t *testing.T) {
 func TestStreamMeetingRenewsWithoutClosingMeeting(t *testing.T) {
 	var grants atomic.Int32
 	var audioBytes atomic.Int32
+	initialAudioSent := make(chan struct{})
+	var initialAudioSentOnce sync.Once
 	var synced []cloudSegment
 	var ended []string
 	var mu sync.Mutex
@@ -270,11 +272,19 @@ func TestStreamMeetingRenewsWithoutClosingMeeting(t *testing.T) {
 			}
 			if kind == websocket.BinaryMessage {
 				audioBytes.Add(int32(len(data)))
+				if key != "second-key" {
+					initialAudioSentOnce.Do(func() { close(initialAudioSent) })
+				}
 			}
 		}
 	}, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/api/transcription-sessions":
+			select {
+			case <-initialAudioSent:
+			case <-r.Context().Done():
+				return
+			}
 			var body map[string]string
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			if body["meetingId"] != "m" {
