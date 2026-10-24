@@ -100,6 +100,8 @@ Approve microphone and Screen & System Audio Recording permission when macOS req
 
 The main window shows recording state, elapsed recording time, separate audio meters, finalized text, and partial speech. The live view retains the latest 500 finalized segments. Complete transcripts remain in **History**.
 
+![Titen recording view](docs/screenshots/native-recording.png)
+
 Closing the window hides it. Recording continues. The menu bar provides start, pause, resume, stop, open, and quit actions. Quit ends capture and allows up to 15 seconds for final transcription before leaving.
 
 Pause terminates capture. To change microphones, pause, open **Settings**, refresh the microphone list, choose a device, save, and resume. Source modes support both inputs, microphone only, and system audio only. On macOS, microphone-only mode uses AVFoundation and requires microphone permission only. Windows uses WASAPI.
