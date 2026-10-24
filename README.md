@@ -8,14 +8,16 @@ The web UI and SaaS backend are implemented separately in [titen-web](../titen-w
 
 ## Build and run on macOS
 
-You need macOS 15 or later, Xcode Command Line Tools with Swift, and Go 1.27.1 or later. The native build does not need Node, Bun, Vite, or a web server.
+You need macOS 15 or later, Xcode Command Line Tools with Swift, OpenSSL 3, and Go 1.27.1 or later. The native build does not need Node, Bun, Vite, or a web server.
 
 ```sh
 sh scripts/build-macos.sh
 open build/Titen.app
 ```
 
-The script builds the Swift helper and Go application, creates the app bundle, and signs it ad hoc for local use. Developer ID signing and notarization are not included. The bundle contains both executables under Contents/MacOS. Keep them together.
+The script builds the Swift helper and Go application, creates the app bundle, and signs the app and helper with the persistent `Titen Self-Signed Code Signing` identity. The first build creates the self-signed certificate in your login keychain, stores the PKCS#12 file under `~/Library/Application Support/Titen/Signing/`, and keeps its passphrase in the login Keychain. Later builds reuse it. The bundle contains both executables under Contents/MacOS. Keep them together.
+
+This does not notarize the app. A first launch on another Mac can still show Gatekeeper's unidentified developer warning. The stable certificate, bundle IDs, designated requirements, and entitlements let macOS match TCC permissions across rebuilds. The same certificate should be reused for every tagged build.
 
 For development, build the helper first with the build script, then run `go run .` from the project root. The app locates the release helper under native/macos/.build/release when it is not beside the Go executable. The packaged app gives macOS a stable bundle identity for permission checks.
 
@@ -49,7 +51,20 @@ Each successful run uploads three downloadable GitHub Actions artifacts. Each ar
 
 Download them from the workflow run's Artifacts section. Version tags set the embedded application version and archive filenames. The workflow does not create tags or publish GitHub Releases. A failed platform build fails its job and produces no successful package for that platform.
 
-macOS packages are ad hoc signed for local testing. Windows packages are unsigned. Developer ID signing, notarization, and Windows signing require separate distribution configuration. Do not treat a downloadable archive as trusted production distribution.
+macOS packages on branches, pull requests, and manual runs use an ephemeral self-signed identity for build validation. Tagged macOS builds require the shared signing certificate secrets described below; the job fails if either secret is missing, so a tag cannot silently produce an ad hoc package. Windows packages are unsigned. The self-signed macOS packages are not notarized, so Gatekeeper can still warn on first launch.
+
+### Persistent macOS signing in GitHub Actions
+
+Create the local certificate once, then store that exact PKCS#12 file and password as repository secrets. This keeps the CI signer consistent with local builds and across tags:
+
+```sh
+sh scripts/sign-cert.sh
+signing_dir="$HOME/Library/Application Support/Titen/Signing"
+base64 < "$signing_dir/titen-self-signed.p12" | tr -d '\n' | gh secret set TITEN_SIGNING_CERTIFICATE
+swift scripts/keychain-password.swift get co.nggalek.titen.codesign.p12 'Titen Self-Signed Code Signing' | gh secret set TITEN_SIGNING_CERTIFICATE_PASSWORD
+```
+
+The private key stays in the PKCS#12 file and local Keychain. The passphrase is stored in the macOS login Keychain instead of a plaintext file. The two GitHub repository secrets are encrypted by GitHub and available to Actions; Base64 only encodes the PKCS#12 for transport. Keep both secrets unchanged for every release. No paid Apple Developer account is used. The version-tag workflow imports the identity into a temporary keychain, signs both executables and the app, validates the designated requirements and entitlements, and removes the temporary keychain after packaging.
 
 See [cross-platform architecture and verification](docs/cross-platform/README.md).
 
@@ -109,7 +124,7 @@ See [architecture](docs/architecture.md), [verification results](docs/verificati
 ## Troubleshoot
 
 - Startup checks inspect the selected audio mode and account access. Recording and resume stay disabled until those checks pass. Use **Request access** to show macOS permission prompts, then **Recheck** after changing permissions. Settings, logs, and stop controls remain available.
-- Local macOS builds use ad hoc signing by default. Rebuilding changes the signing hash, so an enabled entry in System Settings can refer to an earlier build. Approve access for the current build and restart Titen if macOS requests it. Set `TITEN_CODESIGN_IDENTITY` to an installed signing identity when building for a stable certificate identity.
+- Local macOS builds create and reuse the persistent self-signed identity automatically. If the certificate is missing from the login keychain, run `sh scripts/sign-cert.sh`; do not delete the signing files under `~/Library/Application Support/Titen/Signing/` or the passphrase item in the login Keychain, or replace the certificate used by GitHub Actions. A change of signer can require granting TCC permissions again.
 - In **Settings → Open logs**, locate `titen.log` and attach it when reporting a problem. Logs persist across app restarts in the Titen config directory (`~/Library/Application Support/Titen/logs/` on macOS). Each line is a JSON event written with Go's `log/slog`, including timestamps and audio helper failure details. Audio samples and transcript content are not logged.
 - If the helper cannot start, rebuild the bundle and check its path in **Settings**.
 - If either meter stays at zero, check permission, source mode, microphone selection, and whether the meeting is producing playback audio.
@@ -130,12 +145,10 @@ To refresh access for the current build:
 5. Ensure its toggle is on, authenticate if requested, and choose **Quit & Reopen** if offered. Otherwise, launch that app bundle yourself.
 6. Confirm the startup warning disappears and **Start recording** becomes enabled. Use **Recheck** if needed. This verifies the permission check; verify live capture separately before a meeting.
 
-To reduce permission resets after rebuilding, use the same persistent code-signing certificate for every build instead of the default ad hoc signature:
+To verify that microphone and Screen Recording access survive rebuilds, run the macOS check below. It requests any missing permission once, then builds twice and compares the signed IDs, certificate fingerprint, designated requirements, and entitlements while checking access through the same native APIs Titen uses:
 
 ```sh
-# List installed code-signing identities, then use the exact certificate name.
-security find-identity -v -p codesigning
-TITEN_CODESIGN_IDENTITY='Your installed signing certificate name' sh scripts/build-macos.sh
+sh scripts/verify-macos-signing.sh
 ```
 
-The build script signs both the app and `titen-audio` helper with that identity. Keep the certificate, bundle identifiers (`co.nggalek.titen` and `co.nggalek.titen.audio`), and launch location consistent. A persistent local code-signing certificate is an option for development on your Mac; use Apple Developer ID signing and notarization for distribution. Certificate signing reduces identity changes but does not guarantee macOS will never request consent again. After changing signing identities, refresh the permission entry once using the steps above.
+The app bundle ID is `co.nggalek.titen`; the audio helper ID is `co.nggalek.titen.audio`. Their designated requirements use those IDs and the stable certificate common name. The checked-in `packaging/macos/Titen.entitlements` file is intentionally empty because the app is not sandboxed; microphone and Screen Recording access are governed by TCC prompts and the usage strings in `Info.plist`. Do not change these values casually. Apple Developer ID signing and notarization would still be required to remove Gatekeeper's first-launch warning.

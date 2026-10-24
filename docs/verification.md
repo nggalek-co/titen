@@ -44,6 +44,12 @@ No real Soniox credentials or Google OAuth grants were exercised. Live Indonesia
 
 Unconfirmed audio can be lost after a provider disconnect. The temporary spool preserves unsent audio only while the process lives, with a 1 GiB total limit. Stop allows up to 15 seconds for finalization and may leave speech missing after a longer outage. Named ranges must remain intact for append reconciliation. Document creation can leave an orphan document after an ambiguous success because the Docs create API does not use the append markers. Existing arbitrary documents require an app authorization mechanism such as a picker, which is not included.
 
-Distribution signing, notarization, Windows capture, and Linux support are not included. There is no Git repository in the supplied checkout, so no commit, push, or PR was created.
+Apple Developer ID distribution signing, notarization, Windows capture, and Linux support were not included in the original 20 October verification. That run did not create a commit, push, or PR.
 
 Follow manual-testing.md to close the live acceptance gates. The PRD's primary end-to-end success criterion is NOT VERIFIED.
+
+## Persistent signing follow-up
+
+On 24 October 2026, the Apple silicon local signing check built Titen twice in sequence using the persistent self-signed certificate. After build 1 and again after build 2, the packaged helper's native permission check reported Microphone and Screen Recording authorized. The check also compared the app/helper bundle IDs, signer fingerprint, designated requirements, and entitlements; each value matched across both builds. No TCC entry was reset during this check.
+
+A separate package run imported the same PKCS#12 into a temporary keychain, built and signed the app, and passed `cmd/packagecheck` on the resulting macOS ARM64 ZIP and SHA256. This exercises the temporary-keychain path used by GitHub Actions locally. The workflow has not been run on GitHub with repository secrets, and no public GitHub Release was published. These checks do not prove live microphone or system-audio capture on another Mac. Apple Developer ID signing and notarization remain out of scope.

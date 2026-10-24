@@ -11,7 +11,7 @@
 
 ## Done predicate
 
-macOS and Windows builds include a native capture helper, private SQLite persistence, secure credential storage, and native UI. A pushed version tag runs native tests, packages the app and helper, and exposes downloadable archives with checksums through GitHub Actions. A manual dispatch and pull request checks exercise the same build before any release tag is created. Hardware capture and signing trust remain explicit acceptance gates.
+macOS and Windows builds include a native capture helper, private SQLite persistence, secure credential storage, and native UI. A pushed version tag runs native tests, packages the app and helper, and exposes downloadable archives with checksums through GitHub Actions. A manual dispatch and pull request checks exercise the same build before any release tag is created. Hardware capture and notarization remain explicit acceptance gates.
 
 ## Grounding and design
 
