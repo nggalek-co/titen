@@ -658,7 +658,12 @@ func TestStreamProviderErrorDoesNotRetry(t *testing.T) {
 		defer conn.Close()
 		conn.ReadMessage()
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"error_code":403,"error_type":"temp_api_key_session_expired"}`))
-	}, func(w http.ResponseWriter, r *http.Request) { ends.Add(1); w.WriteHeader(204) })
+	}, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/end") {
+			ends.Add(1)
+		}
+		w.WriteHeader(204)
+	})
 	err := client.Stream(context.Background(), directSession(), nil, nil)
 	if err == nil || calls.Load() != 1 || ends.Load() != 1 {
 		t.Fatalf("calls=%d ends=%d err=%v", calls.Load(), ends.Load(), err)

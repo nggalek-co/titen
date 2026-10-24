@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"time"
 
@@ -27,6 +28,7 @@ type providerUpdate struct {
 
 var errTranscriptSyncDeferred = errors.New("Titen transcript upload will retry")
 var errProviderInterrupted = errors.New("Soniox connection interrupted")
+var errProviderCapacity = errors.New("Soniox capacity limit reached")
 
 type streamCursor struct {
 	sequence       int
@@ -59,6 +61,47 @@ func transientRenewalError(err error) bool {
 	}
 	var apiErr *APIError
 	return errors.As(err, &apiErr) && apiErr.Status == 409
+}
+
+// retryDelay honors the server's Retry-After hint before the default wait,
+// so a Titen capacity response paces the fleet instead of fanning retries.
+func retryDelay(err error, fallback time.Duration) time.Duration {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.RetryAfter > fallback {
+		return apiErr.RetryAfter
+	}
+	return fallback
+}
+
+// reportProviderError ships the provider's stable error_type and
+// request_id upstream without blocking or failing the stream on telemetry.
+func (c *Client) reportProviderError(sessionID string, perr *transcription.Error) {
+	go func() {
+		reportCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = c.ReportProviderError(reportCtx, sessionID, perr.Kind, perr.RequestID)
+	}()
+}
+
+// classifyStreamError reports the provider error and decides how the
+// meeting continues: typed Soniox error frames get a retry posture, and
+// anything else keeps the existing reconnect behavior.
+func (c *Client) classifyStreamError(sessionID string, err error) error {
+	var perr *transcription.Error
+	if !errors.As(err, &perr) {
+		return err
+	}
+	c.reportProviderError(sessionID, perr)
+	switch transcription.ClassifyProviderError(perr) {
+	case transcription.ErrorFatal:
+		return perr
+	case transcription.ErrorCapacity:
+		return fmt.Errorf("%w: %s", errProviderCapacity, perr.Kind)
+	default:
+		// Transient failures and grant/stream duration caps all continue the
+		// meeting on the next grant; the renewal path fetches a fresh key.
+		return providerInterrupted(perr.Kind)
+	}
 }
 
 func (c *Client) Run(ctx context.Context, audio <-chan []byte, notify func(transcription.Update)) error {
@@ -150,7 +193,9 @@ func (c *Client) StreamMeeting(ctx context.Context, session Session, audio <-cha
 		grantCtx, cancel := context.WithCancel(streamCtx)
 		go func(s Session) {
 			grantEnd := s.ExpiresAt.Add(time.Duration(s.MaxSessionDurationSeconds) * time.Second)
-			wait := time.Until(grantEnd.Add(-90 * time.Second))
+			// Renew 90–120s early: jitter staggers the fleet's renewal rate
+			// instead of synchronizing every meeting on the same lead.
+			wait := time.Until(grantEnd.Add(-90*time.Second - time.Duration(rand.Int64N(int64(30*time.Second)))))
 			if wait > 0 {
 				timer := time.NewTimer(wait)
 				defer timer.Stop()
@@ -179,7 +224,7 @@ func (c *Client) StreamMeeting(ctx context.Context, session Session, audio <-cha
 					}
 					return
 				}
-				timer := time.NewTimer(5 * time.Second)
+				timer := time.NewTimer(retryDelay(err, 5*time.Second))
 				select {
 				case <-grantCtx.Done():
 					timer.Stop()
@@ -202,6 +247,40 @@ func (c *Client) StreamMeeting(ctx context.Context, session Session, audio <-cha
 			if streamCtx.Err() != nil {
 				return streamCtx.Err()
 			}
+			if errors.Is(err, errProviderCapacity) {
+				// The provider's own quota rejected the stream. Retrying in a
+				// tight loop only deepens the rejection, so reconnects are
+				// spaced tens of seconds apart and still honor Retry-After.
+				if notify != nil {
+					notify(transcription.Update{ConnectionStatus: transcription.ConnectionReconnecting})
+				}
+				capacityDelay := 30 * time.Second
+				for {
+					timer := time.NewTimer(capacityDelay + time.Duration(rand.Int64N(int64(capacityDelay/4))))
+					capacityDelay = min(capacityDelay*2, 5*time.Minute)
+					select {
+					case spoolErr := <-spoolFailure:
+						timer.Stop()
+						return spoolErr
+					case <-streamCtx.Done():
+						timer.Stop()
+						return streamCtx.Err()
+					case <-timer.C:
+					}
+					replacement, authErr := c.AuthorizeRenewal(streamCtx, current.MeetingID)
+					if authErr == nil {
+						current = replacement
+						break
+					}
+					if !transientRenewalError(authErr) {
+						return authErr
+					}
+					if wait := retryDelay(authErr, 0); wait > capacityDelay {
+						capacityDelay = wait
+					}
+				}
+				continue
+			}
 			if !errors.Is(err, errProviderInterrupted) {
 				return err
 			}
@@ -222,6 +301,9 @@ func (c *Client) StreamMeeting(ctx context.Context, session Session, audio <-cha
 				}
 				if !transientRenewalError(err) {
 					return err
+				}
+				if wait := retryDelay(err, 0); wait > reconnectDelay {
+					reconnectDelay = wait
 				}
 			}
 			continue
@@ -252,11 +334,16 @@ func (c *Client) streamGrant(ctx context.Context, session Session, audio <-chan 
 	}
 	conn, resp, err := dial(ctx, session.WSURL, http.Header{"Authorization": []string{"Bearer " + session.TemporaryAPIKey}})
 	if err != nil {
-		if resp != nil && resp.Body != nil {
+		code := 0
+		if resp != nil {
+			code = resp.StatusCode
 			resp.Body.Close()
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if code == http.StatusTooManyRequests {
+			return nil, fmt.Errorf("%w: handshake rejected (HTTP 429)", errProviderCapacity)
 		}
 		return nil, providerInterrupted("Soniox connection failed")
 	}
@@ -297,9 +384,6 @@ func (c *Client) streamGrant(ctx context.Context, session Session, audio <-chan 
 				for i := range event.update.Finals {
 					event.update.Finals[i].StartMS += offsetMs
 					event.update.Finals[i].EndMS += offsetMs
-				}
-				if event.err != nil {
-					event.err = errors.New("Soniox rejected the stream or its session duration expired")
 				}
 				if notify != nil {
 					notify(event.update)
@@ -419,10 +503,11 @@ func (c *Client) streamGrant(ctx context.Context, session Session, audio <-chan 
 				return next, errors.New("Titen transcript upload queue is full; transcript remains saved on this device")
 			}
 			if event.err != nil {
-				if audio == nil && errors.Is(event.err, errProviderInterrupted) {
+				classified := c.classifyStreamError(session.SessionID, event.err)
+				if audio == nil && errors.Is(classified, errProviderInterrupted) {
 					return next, errors.New("Soniox disconnected before finalizing; unfinalized speech may be missing")
 				}
-				return next, event.err
+				return next, classified
 			}
 			if event.finished {
 				if renewable && audio != nil && next == nil {

@@ -47,13 +47,51 @@ type response struct {
 	Finished  bool    `json:"finished"`
 	ErrorCode int     `json:"error_code"`
 	ErrorType string  `json:"error_type"`
-}
-type providerError struct {
-	code int
-	kind string
+	RequestID string  `json:"request_id"`
 }
 
-func (e providerError) Error() string { return fmt.Sprintf("Soniox %s (%d)", e.kind, e.code) }
+// Error is a provider error frame. Kind carries Soniox's stable
+// error_type slug — classify on it, never on the message text. RequestID
+// correlates with provider logs and is safe to report upstream.
+type Error struct {
+	Code      int
+	Kind      string
+	RequestID string
+}
+
+func (e *Error) Error() string { return fmt.Sprintf("Soniox %s (%d)", e.Kind, e.Code) }
+
+// ErrorClass tells the caller how to react to a provider error.
+type ErrorClass int
+
+const (
+	// ErrorFatal ends the meeting: auth, request-shape, and account-state
+	// errors cannot be fixed by reconnecting.
+	ErrorFatal ErrorClass = iota
+	// ErrorTransient reconnects with normal backoff.
+	ErrorTransient
+	// ErrorRotateGrant ends the stream but keeps the meeting: the grant or
+	// the provider stream hit its duration cap, so renew and continue.
+	ErrorRotateGrant
+	// ErrorCapacity means the provider quota itself rejected the stream.
+	// Retries must back off far longer than an ordinary reconnect.
+	ErrorCapacity
+)
+
+// ClassifyProviderError maps Soniox's stable error_type slugs
+// (docs/api-reference/errors) to a retry posture.
+func ClassifyProviderError(e *Error) ErrorClass {
+	switch e.Kind {
+	case "max_duration_reached", "temp_api_key_session_expired":
+		return ErrorRotateGrant
+	case "max_concurrent_connections_reached", "limit_exceeded":
+		return ErrorCapacity
+	case "service_unavailable", "internal_error", "request_timeout":
+		return ErrorTransient
+	default:
+		return ErrorFatal
+	}
+}
 
 type Assembler struct {
 	Offset    int64
@@ -67,7 +105,7 @@ func (a *Assembler) Update(raw []byte) (Update, bool, error) {
 		return Update{}, false, err
 	}
 	if r.ErrorCode != 0 {
-		return Update{}, false, providerError{r.ErrorCode, r.ErrorType}
+		return Update{}, false, &Error{r.ErrorCode, r.ErrorType, r.RequestID}
 	}
 	u := Update{}
 	if a.seen == nil {
@@ -242,8 +280,8 @@ func (c *Client) stream(ctx context.Context, audio <-chan []byte, notify func(Up
 		rotate.Stop()
 		conn.Close()
 		<-readerDone
-		var permanent providerError
-		if errors.As(streamErr, &permanent) && permanent.code < 500 && permanent.code != 429 {
+		var permanent *Error
+		if errors.As(streamErr, &permanent) && permanent.Code < 500 && permanent.Code != 429 {
 			return streamErr
 		}
 		if closed {

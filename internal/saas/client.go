@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,10 +72,12 @@ type Heartbeat struct {
 }
 
 // APIError carries the HTTP status for UI classification while keeping the
-// user-facing message.
+// user-facing message. RetryAfter mirrors the server's Retry-After header
+// on 429 and 503 capacity responses.
 type APIError struct {
-	Status  int
-	Message string
+	Status     int
+	Message    string
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string { return e.Message }
@@ -156,7 +159,7 @@ func (c *Client) request(ctx context.Context, method, path string, body, result 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, statusError(resp.StatusCode)
+		return resp.StatusCode, statusError(resp)
 	}
 	if resp.StatusCode == http.StatusNoContent {
 		return resp.StatusCode, nil
@@ -167,8 +170,13 @@ func (c *Client) request(ctx context.Context, method, path string, body, result 
 	return resp.StatusCode, nil
 }
 
-func statusError(status int) error {
+func statusError(resp *http.Response) error {
+	status := resp.StatusCode
 	message := fmt.Sprintf("Titen server request failed (HTTP %d)", status)
+	var retryAfter time.Duration
+	if seconds, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && seconds > 0 {
+		retryAfter = time.Duration(seconds) * time.Second
+	}
 	switch status {
 	case 401, 403:
 		message = "Titen sign-in expired or was revoked; sign in again in Settings"
@@ -176,8 +184,18 @@ func statusError(status int) error {
 		message = "Titen credit exhausted; top up your account on the website"
 	case 400, 404:
 		message = "Titen request expired or was rejected; try again"
+	case 429:
+		message = "Titen transcription capacity is full; retry later"
+		if retryAfter > 0 {
+			message = fmt.Sprintf("Titen transcription capacity is full; retry in %s", retryAfter.Round(time.Second))
+		}
+	case 503:
+		message = "Titen transcription is temporarily unavailable; retry later"
+		if retryAfter > 0 {
+			message = fmt.Sprintf("Titen transcription is temporarily unavailable; retry in %s", retryAfter.Round(time.Second))
+		}
 	}
-	return &APIError{Status: status, Message: message}
+	return &APIError{Status: status, Message: message, RetryAfter: retryAfter}
 }
 
 func (c *Client) BeginDevice(ctx context.Context, name string) (DeviceCode, error) {
@@ -292,6 +310,99 @@ func (c *Client) End(ctx context.Context, session Session) error {
 	var result json.RawMessage
 	_, err := c.request(ctx, http.MethodPost, "/api/transcription-sessions/"+url.PathEscape(session.SessionID)+"/end", map[string]string{}, &result, true)
 	return err
+}
+
+// ReportProviderError forwards the provider's stable error_type and
+// request_id to the backend. The Worker cannot see the direct WebSocket,
+// so these reports are its only signal about provider-side failures.
+func (c *Client) ReportProviderError(ctx context.Context, sessionID, errorType, requestID string) error {
+	if sessionID == "" || errorType == "" {
+		return nil
+	}
+	var result json.RawMessage
+	_, err := c.request(ctx, http.MethodPost, "/api/transcription-sessions/"+url.PathEscape(sessionID)+"/provider-error", map[string]string{
+		"errorType": errorType,
+		"requestId": requestID,
+	}, &result, true)
+	return err
+}
+
+// ChunkRegistration mirrors POST /api/audio-chunks: a presigned R2 PUT URL
+// for one registered WAV chunk.
+type ChunkRegistration struct {
+	ChunkID   string `json:"chunkId"`
+	UploadURL string `json:"uploadUrl"`
+	R2Key     string `json:"r2Key"`
+	Stored    bool   `json:"stored"`
+}
+
+// CreateCloudMeeting opens a cloud meeting for a locally saved recording
+// that never obtained a realtime session (capacity was full at start).
+func (c *Client) CreateCloudMeeting(ctx context.Context, title string) (string, error) {
+	var result struct {
+		MeetingID string `json:"meetingId"`
+	}
+	_, err := c.request(ctx, http.MethodPost, "/api/meetings", map[string]string{"title": title}, &result, true)
+	if err != nil {
+		return "", err
+	}
+	if result.MeetingID == "" {
+		return "", errors.New("Titen server returned an invalid meeting")
+	}
+	return result.MeetingID, nil
+}
+
+func (c *Client) RegisterChunk(ctx context.Context, chunk struct {
+	MeetingID  string `json:"meetingId"`
+	ChunkIndex int    `json:"chunkIndex"`
+	StartMS    int64  `json:"startMs"`
+	DurationMS int64  `json:"durationMs"`
+	Format     string `json:"format"`
+	Checksum   string `json:"checksum"`
+	SizeBytes  int64  `json:"sizeBytes"`
+	Consent    bool   `json:"consent"`
+}) (ChunkRegistration, error) {
+	var registration ChunkRegistration
+	_, err := c.request(ctx, http.MethodPost, "/api/audio-chunks", chunk, &registration, true)
+	if err != nil {
+		return registration, err
+	}
+	if registration.ChunkID == "" || registration.UploadURL == "" {
+		return registration, errors.New("Titen server returned an invalid chunk upload URL")
+	}
+	return registration, nil
+}
+
+func (c *Client) MarkChunkUploaded(ctx context.Context, chunkID string) error {
+	var result json.RawMessage
+	_, err := c.request(ctx, http.MethodPost, "/api/audio-chunks/"+url.PathEscape(chunkID)+"/uploaded", map[string]string{}, &result, true)
+	return err
+}
+
+// UploadAudio PUTs bytes straight to the presigned object URL — the Titen
+// token does not go there and the body is not logged.
+func (c *Client) UploadAudio(ctx context.Context, uploadURL string, data []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(data))
+	if err != nil {
+		return errors.New("could not create audio upload request")
+	}
+	h := http.Client{Timeout: 5 * time.Minute}
+	if c.HTTP != nil {
+		h = *c.HTTP
+		h.Timeout = 5 * time.Minute
+	}
+	resp, err := h.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("audio upload rejected (HTTP %d)", resp.StatusCode)
+	}
+	return nil
 }
 
 func (c *Client) validateURL(raw string) error {
