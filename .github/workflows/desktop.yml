@@ -62,6 +62,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go run github.com/egoist/mygo/cmd/mygo vet .
           exit $LASTEXITCODE
+      - name: Create temporary signing keychain for macOS builds
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/titen-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "::add-mask::$keychain_password"
+          {
+            echo "TITEN_CODESIGN_KEYCHAIN=$keychain"
+            echo "TITEN_CODESIGN_KEYCHAIN_PASSWORD=$keychain_password"
+          } >> "$GITHUB_ENV"
       - name: Import the persistent signing identity for tagged macOS builds
         if: runner.os == 'macOS' && github.ref_type == 'tag'
         shell: bash
@@ -75,10 +90,9 @@ jobs:
             echo "::error::Tagged macOS builds require TITEN_SIGNING_CERTIFICATE and TITEN_SIGNING_CERTIFICATE_PASSWORD so every release uses the same signing identity."
             exit 1
           fi
-          keychain="$RUNNER_TEMP/titen-signing.keychain-db"
+          keychain="$TITEN_CODESIGN_KEYCHAIN"
           p12="$RUNNER_TEMP/titen-signing.p12"
           certificate="$RUNNER_TEMP/titen-signing-cert.pem"
-          keychain_password="$(openssl rand -hex 32)"
           printf '%s' "$TITEN_SIGNING_CERTIFICATE" | tr -d '[:space:]' | openssl base64 -d -A > "$p12"
           if [ ! -s "$p12" ]; then
             echo "::error::TITEN_SIGNING_CERTIFICATE is not valid base64 PKCS#12 data."
@@ -92,11 +106,8 @@ jobs:
           if ! openssl pkcs12 -in "$p12" -clcerts -nokeys -passin "pass:$TITEN_SIGNING_CERTIFICATE_PASSWORD" -out "$certificate" 2>/dev/null; then
             openssl pkcs12 -legacy -in "$p12" -clcerts -nokeys -passin "pass:$TITEN_SIGNING_CERTIFICATE_PASSWORD" -out "$certificate" 2>/dev/null
           fi
-          security create-keychain -p "$keychain_password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$keychain_password" "$keychain"
           security import "$p12" -k "$keychain" -P "$TITEN_SIGNING_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$TITEN_CODESIGN_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
           security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$certificate" >/dev/null
           identities="$(security find-identity -v -p codesigning "$keychain")"
           if ! printf '%s\n' "$identities" | grep -Fq "\"$TITEN_CODESIGN_IDENTITY\""; then
@@ -107,6 +118,8 @@ jobs:
       - name: Package macOS
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          TITEN_SIGNING_EPHEMERAL: ${{ github.ref_type != 'tag' && '1' || '0' }}
         run: sh scripts/build-macos.sh
       - name: Package Windows
         if: runner.os == 'Windows'
@@ -127,7 +140,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Remove temporary signing keychain
-        if: always() && runner.os == 'macOS' && github.ref_type == 'tag'
+        if: always() && runner.os == 'macOS'
         shell: bash
         run: |
           security delete-keychain "$RUNNER_TEMP/titen-signing.keychain-db" 2>/dev/null || true
