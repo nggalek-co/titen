@@ -83,10 +83,13 @@ if [ -z "$certificate_path" ]; then
 				echo "Could not create the temporary code-signing certificate." >&2
 				exit 1
 			fi
-			if ! openssl pkcs12 -export -legacy -inkey "$ephemeral_dir/key.pem" -in "$ephemeral_dir/cert.pem" \
+			if ! openssl pkcs12 -export -inkey "$ephemeral_dir/key.pem" -in "$ephemeral_dir/cert.pem" \
 				-out "$certificate_path" -passout "pass:$certificate_password" >/dev/null 2>&1; then
-				echo "Could not package the temporary code-signing certificate." >&2
-				exit 1
+				if ! openssl pkcs12 -export -legacy -inkey "$ephemeral_dir/key.pem" -in "$ephemeral_dir/cert.pem" \
+					-out "$certificate_path" -passout "pass:$certificate_password" >/dev/null 2>&1; then
+					echo "Could not package the temporary code-signing certificate." >&2
+					exit 1
+				fi
 			fi
 			chmod 600 "$ephemeral_dir/key.pem" "$ephemeral_dir/cert.pem" "$certificate_path"
 			echo "Created a temporary signing certificate for this GitHub Actions job."
