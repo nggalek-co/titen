@@ -169,12 +169,16 @@ else
 	security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$tmp_dir/cert.pem" >/dev/null
 fi
 
-echo "Checking that the signing identity is available to codesign."
-installed_fingerprints=$(identity_fingerprints)
-if ! printf '%s\n' "$installed_fingerprints" | grep -Fxiq "$expected_fingerprint"; then
-	echo "Imported certificate is not a valid code-signing identity in $keychain" >&2
-	echo "Check the keychain trust settings and confirm the certificate has codeSigning usage." >&2
-	exit 1
+if [ "${TITEN_CODESIGN_CI:-0}" = 1 ]; then
+	echo "The package signing step will verify the imported identity."
+else
+	echo "Checking that the signing identity is available to codesign."
+	installed_fingerprints=$(identity_fingerprints)
+	if ! printf '%s\n' "$installed_fingerprints" | grep -Fxiq "$expected_fingerprint"; then
+		echo "Imported certificate is not a valid code-signing identity in $keychain" >&2
+		echo "Check the keychain trust settings and confirm the certificate has codeSigning usage." >&2
+		exit 1
+	fi
 fi
 
 echo "Installed persistent code-signing identity: \"$TITEN_CODESIGN_IDENTITY\""
