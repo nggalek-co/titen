@@ -73,7 +73,7 @@
   "accountTitle": "Akun Titen",
   "accountDesc": "Server mengelola transkripsi dan kredit. Hubungkan Google dari akun web kamu.",
   "serverEndpoint": "Endpoint server",
-  "endpointHint": "Pengembangan lokal baku http://localhost:3000. Server hosting wajib HTTPS.",
+  "endpointHint": "Build produksi menggunakan https://titen.nggalek.co. Pengembangan lokal memakai http://localhost:3000. Endpoint hosting wajib HTTPS.",
   "signInBrowser": "Masuk lewat browser",
   "signedIn": "Sudah masuk",
   "approveCode": "Setujui kode: {code}",

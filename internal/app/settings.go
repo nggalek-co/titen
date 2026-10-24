@@ -5,19 +5,30 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"titen/internal/saas"
 )
 
 type Settings struct {
-	ServerEndpoint string `json:"server_endpoint"`
-	MicrophoneID   string `json:"microphone_id"`
-	CaptureMode    string `json:"capture_mode"`
-	HelperPath     string `json:"helper_path"`
-	Language       string `json:"language"`
+	ServerEndpoint       string `json:"server_endpoint"`
+	ServerEndpointCustom bool   `json:"server_endpoint_custom,omitempty"`
+	MicrophoneID         string `json:"microphone_id"`
+	CaptureMode          string `json:"capture_mode"`
+	HelperPath           string `json:"helper_path"`
+	Language             string `json:"language"`
 }
 
 func LoadSettings(dir string) (Settings, error) {
-	s := Settings{ServerEndpoint: saas.DefaultEndpoint, CaptureMode: "Both", Language: "system"}
+	return LoadSettingsWithDefaultEndpoint(dir, saas.DefaultEndpoint)
+}
+
+func LoadSettingsWithDefaultEndpoint(dir, defaultEndpoint string) (Settings, error) {
+	var err error
+	defaultEndpoint, err = saas.NormalizeEndpoint(defaultEndpoint)
+	if err != nil {
+		return Settings{}, err
+	}
+	s := Settings{ServerEndpoint: defaultEndpoint, CaptureMode: "Both", Language: "system"}
 	b, err := os.ReadFile(filepath.Join(dir, "settings.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -28,7 +39,13 @@ func LoadSettings(dir string) (Settings, error) {
 	if err = json.Unmarshal(b, &s); err != nil {
 		return s, err
 	}
+	if strings.TrimSpace(s.ServerEndpoint) == "" {
+		s.ServerEndpoint = defaultEndpoint
+	}
 	s.ServerEndpoint, err = saas.NormalizeEndpoint(s.ServerEndpoint)
+	if err == nil && !s.ServerEndpointCustom && s.ServerEndpoint == saas.DefaultEndpoint && defaultEndpoint != saas.DefaultEndpoint {
+		s.ServerEndpoint = defaultEndpoint
+	}
 	return s, err
 }
 

@@ -18,7 +18,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const DefaultEndpoint = "http://localhost:3000"
+const (
+	DefaultEndpoint    = "http://localhost:3000"
+	ProductionEndpoint = "https://titen.nggalek.co"
+)
 
 type Client struct {
 	BaseURL           string
