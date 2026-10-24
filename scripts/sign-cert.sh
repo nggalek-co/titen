@@ -162,23 +162,20 @@ if [ -n "${TITEN_CODESIGN_KEYCHAIN_PASSWORD:-}" ]; then
 	security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
 		-k "$TITEN_CODESIGN_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
 fi
+echo "Trusting the self-signed code-signing certificate."
 if [ "${TITEN_CODESIGN_CI:-0}" = 1 ]; then
-	echo "Using the self-signed certificate only in the job keychain."
+	sudo -n security add-trusted-cert -d -r trustRoot -p codeSign \
+		-k /Library/Keychains/System.keychain "$tmp_dir/cert.pem" >/dev/null
 else
-	echo "Trusting the self-signed code-signing certificate in the selected keychain."
 	security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$tmp_dir/cert.pem" >/dev/null
 fi
 
-if [ "${TITEN_CODESIGN_CI:-0}" = 1 ]; then
-	echo "The package signing step will verify the imported identity."
-else
-	echo "Checking that the signing identity is available to codesign."
-	installed_fingerprints=$(identity_fingerprints)
-	if ! printf '%s\n' "$installed_fingerprints" | grep -Fxiq "$expected_fingerprint"; then
-		echo "Imported certificate is not a valid code-signing identity in $keychain" >&2
-		echo "Check the keychain trust settings and confirm the certificate has codeSigning usage." >&2
-		exit 1
-	fi
+echo "Checking that the signing identity is available to codesign."
+installed_fingerprints=$(identity_fingerprints)
+if ! printf '%s\n' "$installed_fingerprints" | grep -Fxiq "$expected_fingerprint"; then
+	echo "Imported certificate is not a valid code-signing identity in $keychain" >&2
+	echo "Check the keychain trust settings and confirm the certificate has codeSigning usage." >&2
+	exit 1
 fi
 
 echo "Installed persistent code-signing identity: \"$TITEN_CODESIGN_IDENTITY\""

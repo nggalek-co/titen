@@ -6,8 +6,12 @@ cd "$(dirname "$0")/.."
 version="${TITEN_VERSION:-dev}"
 case "$version" in ""|*[!A-Za-z0-9._+-]*) echo "Invalid version" >&2; exit 1;; esac
 sh scripts/sign-cert.sh
-signing_identity="$TITEN_CODESIGN_IDENTITY"
 signing_keychain="${TITEN_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
+signing_fingerprint=$(security find-identity -v -p codesigning "$signing_keychain" 2>/dev/null \
+	| awk -v identity="\"$TITEN_CODESIGN_IDENTITY\"" 'index($0, identity) { print $2 }')
+set -- $signing_fingerprint
+[ "$#" -eq 1 ] || { echo "Expected one valid $TITEN_CODESIGN_IDENTITY identity in $signing_keychain; found $#" >&2; exit 1; }
+signing_fingerprint="$1"
 bundle_version=$(printf '%s' "$version" | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p')
 bundle_version="${bundle_version:-0.0.0}"
 export MACOSX_DEPLOYMENT_TARGET=15.0
@@ -40,11 +44,11 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$bundle/Contents/Info.plist"
 plutil -lint "$TITEN_ENTITLEMENTS"
-codesign --force --timestamp=none --sign "$signing_identity" --keychain "$signing_keychain" \
+codesign --force --timestamp=none --sign "$signing_fingerprint" \
   --identifier "$TITEN_AUDIO_BUNDLE_ID" \
   --requirements "=$TITEN_AUDIO_DESIGNATED_REQUIREMENT" \
   --entitlements "$TITEN_ENTITLEMENTS" "$bundle/Contents/MacOS/titen-audio"
-codesign --force --timestamp=none --sign "$signing_identity" --keychain "$signing_keychain" \
+codesign --force --timestamp=none --sign "$signing_fingerprint" \
   --identifier "$TITEN_APP_BUNDLE_ID" \
   --requirements "=$TITEN_APP_DESIGNATED_REQUIREMENT" \
   --entitlements "$TITEN_ENTITLEMENTS" "$bundle"
@@ -57,10 +61,10 @@ verify_signed_target() {
   actual_id=$(printf '%s\n' "$details" | sed -n 's/^Identifier=//p' | head -n 1)
   authority=$(printf '%s\n' "$details" | sed -n 's/^Authority=//p' | head -n 1)
   [ "$actual_id" = "$expected_id" ] || { echo "Unexpected code identifier for $path: $actual_id" >&2; exit 1; }
-  [ "$authority" = "$signing_identity" ] || { echo "Unexpected code signer for $path: $authority" >&2; exit 1; }
+  [ "$authority" = "$TITEN_CODESIGN_IDENTITY" ] || { echo "Unexpected code signer for $path: $authority" >&2; exit 1; }
   actual_requirement=$(codesign -d -r- "$path" 2>&1 | sed -n '/^designated =>/p')
   case "$actual_requirement" in
-    *"identifier \"$expected_id\""*"certificate leaf[subject.CN] = \"$signing_identity\""*) ;;
+    *"identifier \"$expected_id\""*"certificate leaf[subject.CN] = \"$TITEN_CODESIGN_IDENTITY\""*) ;;
     *) echo "Unexpected designated requirement for $path: $actual_requirement" >&2; exit 1;;
   esac
   entitlements_dump=$(mktemp)

@@ -78,12 +78,13 @@ jobs:
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
           echo "::add-mask::$keychain_password"
           {
             echo "TITEN_CODESIGN_KEYCHAIN=$keychain"
             echo "TITEN_CODESIGN_KEYCHAIN_PASSWORD=$keychain_password"
           } >> "$GITHUB_ENV"
-      - name: Import the persistent signing identity for tagged macOS builds
+      - name: Prepare the persistent signing identity for tagged macOS builds
         if: runner.os == 'macOS' && github.ref_type == 'tag'
         shell: bash
         env:
@@ -96,9 +97,8 @@ jobs:
             echo "::error::Tagged macOS builds require TITEN_SIGNING_CERTIFICATE and TITEN_SIGNING_CERTIFICATE_PASSWORD so every release uses the same signing identity."
             exit 1
           fi
-          keychain="$TITEN_CODESIGN_KEYCHAIN"
           p12="$RUNNER_TEMP/titen-signing.p12"
-          certificate="$RUNNER_TEMP/titen-signing-cert.pem"
+          echo "::add-mask::$TITEN_SIGNING_CERTIFICATE_PASSWORD"
           printf '%s' "$TITEN_SIGNING_CERTIFICATE" | tr -d '[:space:]' | openssl base64 -d -A > "$p12"
           if [ ! -s "$p12" ]; then
             echo "::error::TITEN_SIGNING_CERTIFICATE is not valid base64 PKCS#12 data."
@@ -109,19 +109,11 @@ jobs:
             echo "::error::The signing PKCS#12 cannot be opened with TITEN_SIGNING_CERTIFICATE_PASSWORD."
             exit 1
           fi
-          if ! openssl pkcs12 -in "$p12" -clcerts -nokeys -passin "pass:$TITEN_SIGNING_CERTIFICATE_PASSWORD" -out "$certificate" 2>/dev/null; then
-            openssl pkcs12 -legacy -in "$p12" -clcerts -nokeys -passin "pass:$TITEN_SIGNING_CERTIFICATE_PASSWORD" -out "$certificate" 2>/dev/null
-          fi
-          security import "$p12" -k "$keychain" -P "$TITEN_SIGNING_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$TITEN_CODESIGN_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
-          sudo -n security add-trusted-cert -d -r trustRoot -p codeSign \
-            -k /Library/Keychains/System.keychain "$certificate" >/dev/null
-          identities="$(security find-identity -v -p codesigning "$keychain")"
-          if ! printf '%s\n' "$identities" | grep -Fq "\"$TITEN_CODESIGN_IDENTITY\""; then
-            echo "::error::The signing certificate identity must be \"$TITEN_CODESIGN_IDENTITY\"."
-            exit 1
-          fi
-          echo "TITEN_CODESIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          {
+            echo "TITEN_SIGNING_CERTIFICATE_PATH=$p12"
+            echo "TITEN_SIGNING_CERTIFICATE_PASSWORD=$TITEN_SIGNING_CERTIFICATE_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "Package macOS will import and verify the persistent signer in the job keychain."
       - name: Package macOS
         if: runner.os == 'macOS'
         shell: bash
@@ -157,8 +149,9 @@ jobs:
         if: always() && runner.os == 'macOS'
         shell: bash
         run: |
+          security list-keychains -d user -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
           security delete-keychain "$RUNNER_TEMP/titen-signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/titen-signing.p12" "$RUNNER_TEMP/titen-signing-cert.pem"
+          rm -f "$RUNNER_TEMP/titen-signing.p12"
 
   publish-release:
     if: github.ref_type == 'tag'
