@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/plugins/updater"
+	updaternative "github.com/egoist/mygo/plugins/updater/native"
 	"github.com/egoist/mygo/ui"
 	"github.com/oneo-me/onevra/source/components"
 	"github.com/oneo-me/onevra/source/icons/lucide"
@@ -1005,6 +1007,13 @@ func (d *desktop) settingsView(c *ui.Context) {
 						components.Text(c, d.microphoneTestStatus).FontSize(12).FontWeight(500)
 					}
 					components.Text(c, d.tr(c, "micTestNote")).FontSize(11).TextColor(t.TextMuted)
+					if runtime.GOOS == "windows" {
+						components.Button(c, d.tr(c, "micPrivacySettings"), components.ButtonSecondary).OnClick(func() {
+							if err := mygo.Shell.OpenExternal("ms-settings:privacy-microphone"); err != nil {
+								d.message = err.Error()
+							}
+						})
+					}
 				})
 				ui.Column(c).Gap(5).Children(func() {
 					components.Text(c, d.tr(c, "audioSources")).FontSize(12).FontWeight(600)
@@ -1025,14 +1034,18 @@ func (d *desktop) settingsView(c *ui.Context) {
 }
 
 func (d *desktop) menu() *mygo.Menu {
-	return mygo.NewMenu([]*mygo.MenuItem{
+	items := []*mygo.MenuItem{
 		{Label: locales.T("menuOpen"), Click: func(*mygo.MenuItem, *mygo.Window) { d.win.Show(); d.win.Focus() }},
 		{ID: "start", Label: locales.T("menuStart"), Click: func(*mygo.MenuItem, *mygo.Window) { d.start() }},
 		{ID: "pause", Label: locales.T("menuPause"), Click: func(*mygo.MenuItem, *mygo.Window) { d.async(d.service.Pause) }},
 		{ID: "resume", Label: locales.T("menuResume"), Click: func(*mygo.MenuItem, *mygo.Window) { d.resume() }},
 		{ID: "stop", Label: locales.T("menuStop"), Click: func(*mygo.MenuItem, *mygo.Window) { d.stop() }},
-		mygo.Separator(), {Label: locales.T("menuQuit"), Click: func(*mygo.MenuItem, *mygo.Window) { mygo.App.Quit() }},
-	})
+	}
+	if runtime.GOOS == "windows" {
+		items = append(items, mygo.Separator(), updater.MenuItem())
+	}
+	items = append(items, mygo.Separator(), &mygo.MenuItem{Label: locales.T("menuQuit"), Click: func(*mygo.MenuItem, *mygo.Window) { mygo.App.Quit() }})
+	return mygo.NewMenu(items)
 }
 
 func (d *desktop) syncTrayMenu() {
@@ -1157,6 +1170,13 @@ func trayIcon() []byte {
 
 var version = "dev"
 
+func currentVersion() string {
+	if packaged := mygo.App.Version(); packaged != "" {
+		return packaged
+	}
+	return version
+}
+
 func main() {
 	dir, err := os.UserConfigDir()
 	if err != nil {
@@ -1213,8 +1233,11 @@ func main() {
 		d.microphone = cfg.MicrophoneID
 	}
 	d.applyLanguage()
-	slog.Info("starting Titen", "version", version, "os", runtime.GOOS, "arch", runtime.GOARCH)
 	mygo.App.SetName("Titen")
+	if runtime.GOOS == "windows" {
+		mygo.Use(updaternative.Plugin)
+	}
+	slog.Info("starting Titen", "version", currentVersion(), "os", runtime.GOOS, "arch", runtime.GOARCH)
 	mygo.App.OnWindowAllClosed(func() {})
 	mygo.App.WhenReady(d.ready)
 	err = mygo.App.Run()

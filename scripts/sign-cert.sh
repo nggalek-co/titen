@@ -28,6 +28,16 @@ certificate_dir="${TITEN_SIGNING_CERT_DIR:-$HOME/Library/Application Support/Tit
 certificate_path="${TITEN_SIGNING_CERTIFICATE_PATH:-}"
 certificate_password="${TITEN_SIGNING_CERTIFICATE_PASSWORD:-}"
 legacy_password_path="$certificate_dir/titen-self-signed.password"
+creation_dir=""
+ephemeral_dir=""
+tmp_dir=""
+
+cleanup() {
+	[ -z "$creation_dir" ] || rm -rf "$creation_dir"
+	[ -z "$ephemeral_dir" ] || rm -rf "$ephemeral_dir"
+	[ -z "$tmp_dir" ] || rm -rf "$tmp_dir"
+}
+trap cleanup EXIT HUP INT TERM
 
 store_local_password() {
 	printf '%s' "$1" | swift scripts/keychain-password.swift set "$TITEN_SIGNING_PASSWORD_SERVICE" "$TITEN_SIGNING_PASSWORD_ACCOUNT" >/dev/null
@@ -60,26 +70,47 @@ if [ -z "$certificate_path" ]; then
 		exit 1
 	else
 		certificate_path="$local_certificate_path"
-		mkdir -p "$certificate_dir"
-		chmod 700 "$certificate_dir"
-		tmp_dir=$(mktemp -d "$certificate_dir/.create.XXXXXX")
-		trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 		umask 077
-		certificate_password=$(openssl rand -hex 32)
-		openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-			-keyout "$tmp_dir/key.pem" -out "$tmp_dir/cert.pem" \
-			-subj "/CN=$TITEN_CODESIGN_IDENTITY" \
-			-addext "keyUsage=critical,digitalSignature" \
-			-addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1
-		openssl pkcs12 -export -legacy -inkey "$tmp_dir/key.pem" -in "$tmp_dir/cert.pem" \
-			-out "$tmp_dir/titen-self-signed.p12" -passout "pass:$certificate_password" >/dev/null 2>&1
-		store_local_password "$certificate_password"
-		cp "$tmp_dir/cert.pem" "$certificate_dir/titen-self-signed.pem"
-		cp "$tmp_dir/titen-self-signed.p12" "$certificate_path"
-		chmod 600 "$certificate_dir/titen-self-signed.pem" "$certificate_path"
-		rm -rf "$tmp_dir"
-		trap - EXIT HUP INT TERM
-		echo "Created persistent signing certificate at $certificate_path"
+		if [ "${TITEN_SIGNING_EPHEMERAL:-0}" = 1 ]; then
+			ephemeral_dir=$(mktemp -d "${TMPDIR:-/tmp}/titen-signing.XXXXXX")
+			certificate_path="$ephemeral_dir/titen-self-signed.p12"
+			certificate_password=$(openssl rand -hex 32)
+			if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+				-keyout "$ephemeral_dir/key.pem" -out "$ephemeral_dir/cert.pem" \
+				-subj "/CN=$TITEN_CODESIGN_IDENTITY" \
+				-addext "keyUsage=critical,digitalSignature" \
+				-addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1; then
+				echo "Could not create the temporary code-signing certificate." >&2
+				exit 1
+			fi
+			if ! openssl pkcs12 -export -inkey "$ephemeral_dir/key.pem" -in "$ephemeral_dir/cert.pem" \
+				-out "$certificate_path" -passout "pass:$certificate_password" \
+				-keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 >/dev/null 2>&1; then
+				echo "Could not package the temporary code-signing certificate." >&2
+				exit 1
+			fi
+			chmod 600 "$ephemeral_dir/key.pem" "$ephemeral_dir/cert.pem" "$certificate_path"
+			echo "Created a temporary signing certificate for this GitHub Actions job."
+		else
+			mkdir -p "$certificate_dir"
+			chmod 700 "$certificate_dir"
+			creation_dir=$(mktemp -d "$certificate_dir/.create.XXXXXX")
+			certificate_password=$(openssl rand -hex 32)
+			openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+				-keyout "$creation_dir/key.pem" -out "$creation_dir/cert.pem" \
+				-subj "/CN=$TITEN_CODESIGN_IDENTITY" \
+				-addext "keyUsage=critical,digitalSignature" \
+				-addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1
+			openssl pkcs12 -export -legacy -inkey "$creation_dir/key.pem" -in "$creation_dir/cert.pem" \
+				-out "$creation_dir/titen-self-signed.p12" -passout "pass:$certificate_password" >/dev/null 2>&1
+			store_local_password "$certificate_password"
+			cp "$creation_dir/cert.pem" "$certificate_dir/titen-self-signed.pem"
+			cp "$creation_dir/titen-self-signed.p12" "$certificate_path"
+			chmod 600 "$certificate_dir/titen-self-signed.pem" "$certificate_path"
+			rm -rf "$creation_dir"
+			creation_dir=""
+			echo "Created persistent signing certificate at $certificate_path"
+		fi
 	fi
 fi
 
@@ -87,7 +118,6 @@ fi
 [ -n "$certificate_password" ] || { echo "Set TITEN_SIGNING_CERTIFICATE_PASSWORD for this certificate" >&2; exit 1; }
 
 tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 expected_fingerprint=$(certificate_fingerprint "$certificate_path" "$certificate_password") || {
 	echo "Cannot read the signing certificate. Check its password and OpenSSL legacy support." >&2
 	exit 1
@@ -125,9 +155,22 @@ openssl pkcs12 -legacy -in "$certificate_path" -clcerts -nokeys -passin "pass:$c
 	exit 1
 }
 
+echo "Importing the signing identity into the selected keychain."
 security import "$certificate_path" -k "$keychain" -P "$certificate_password" -T /usr/bin/codesign >/dev/null
-security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$tmp_dir/cert.pem" >/dev/null
+if [ -n "${TITEN_CODESIGN_KEYCHAIN_PASSWORD:-}" ]; then
+	echo "Configuring codesign access to the selected keychain."
+	security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+		-k "$TITEN_CODESIGN_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+fi
+echo "Trusting the self-signed code-signing certificate."
+if [ "${TITEN_CODESIGN_CI:-0}" = 1 ]; then
+	sudo -n security add-trusted-cert -d -r trustRoot -p codeSign \
+		-k /Library/Keychains/System.keychain "$tmp_dir/cert.pem" >/dev/null
+else
+	security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$tmp_dir/cert.pem" >/dev/null
+fi
 
+echo "Checking that the signing identity is available to codesign."
 installed_fingerprints=$(identity_fingerprints)
 if ! printf '%s\n' "$installed_fingerprints" | grep -Fxiq "$expected_fingerprint"; then
 	echo "Imported certificate is not a valid code-signing identity in $keychain" >&2

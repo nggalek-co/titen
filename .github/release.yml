@@ -1,0 +1,6 @@
+template: |
+  ## Windows installer
+
+  Titen's Windows installer and app executables are unsigned. SmartScreen may show a warning. Download only from this official release, compare the installer with its `.sha256` file, and proceed only if you expected this download and trust it. Smart App Control or organization policy may block unsigned apps.
+
+  Titen's Ed25519 update signature verifies in-app update archives; it is not an Authenticode signature and does not remove Windows warnings.
