@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,10 @@ const (
 
 const preAuthorizationAudioChunks = 1250
 
+// Local retained audio is bounded: about five hours of WAV before the
+// writer stops the meeting with a clear message.
+const audioRecordingLimitBytes = 600 << 20
+
 type Snapshot struct {
 	State                        State
 	MeetingID                    string
@@ -43,10 +48,14 @@ type Snapshot struct {
 
 type Service struct {
 	Store           *storage.Store
+	RecordingsDir   string
 	op              sync.Mutex
 	mu              sync.Mutex
 	state           Snapshot
 	settings        Settings
+	recorder        *transcription.Recorder
+	client          *saas.Client
+	needsRecovery   bool
 	capture         *audio.Capture
 	captureDone     chan struct{}
 	chunks          chan []byte
@@ -110,6 +119,7 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 	s.state = Snapshot{State: Starting, TranscriptionStatus: transcription.ConnectionConnecting}
 	s.mu.Unlock()
 	client := &saas.Client{BaseURL: cfg.ServerEndpoint, Token: key}
+	s.client = client
 	var session saas.Session
 	meeting, err := s.Store.CreateMeeting(ctx, title)
 	if err != nil {
@@ -142,6 +152,27 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 		s.setIdle()
 		return errors.Join(cause, markErr, finishErr)
 	}
+	// Opt-in full-audio retention: recording starts with the first captured
+	// sample, before any grant, so audio survives a failed authorization.
+	if cfg.RetainFullAudio && s.RecordingsDir != "" {
+		recorder, err := transcription.NewRecorder(
+			filepath.Join(s.RecordingsDir, meeting.ID), meeting.ID, audioRecordingLimitBytes,
+			func(meta transcription.ChunkMeta) {
+				_ = s.Store.AddAudioChunk(context.Background(), storage.AudioChunk{
+					ID: meta.ID, MeetingID: meta.MeetingID, Index: meta.Index,
+					StartMS: meta.StartMS, DurationMS: meta.DurationMS, Checksum: meta.Checksum,
+					Path: meta.Path, SizeBytes: meta.SizeBytes, State: "local_ready",
+				})
+			},
+			func(err error) { s.failIncomplete(err) },
+			storage.NewID,
+		)
+		if err != nil {
+			return finishFailedStart(err)
+		}
+		s.recorder = recorder
+		s.needsRecovery = false
+	}
 	if err := s.beginCapture(streamCtx); err != nil {
 		return finishFailedStart(err)
 	}
@@ -155,7 +186,15 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 	if authorize != nil {
 		session, err = authorize(ctx, client, title)
 		if err != nil {
-			return finishFailedStart(err)
+			var apiErr *saas.APIError
+			capacity := errors.As(err, &apiErr) && (apiErr.Status == 429 || apiErr.Status == 503)
+			// When capacity is full and the user opted in, keep recording
+			// for a delayed transcript instead of losing the meeting.
+			if !(capacity && s.recorder != nil) {
+				return finishFailedStart(err)
+			}
+			s.needsRecovery = true
+			s.fail(err)
 		}
 	}
 	cleanupSession := func() {
@@ -189,6 +228,11 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 	}
 	go func() {
 		defer close(done)
+		// Save-for-later keeps recording without a session or stream; an
+		// injected runner (tests) still runs even with an empty session.
+		if session.SessionID == "" && s.run == nil {
+			return
+		}
 		run := s.run
 		if run == nil {
 			run = func(ctx context.Context, chunks <-chan []byte, notify func(transcription.Update)) error {
@@ -332,6 +376,9 @@ func (s *Service) beginCapture(ctx context.Context) error {
 			s.state.MicrophoneLevel = chunk.MicrophoneLevel
 			s.state.SystemLevel = chunk.SystemLevel
 			s.mu.Unlock()
+			if s.recorder != nil {
+				s.recorder.Write(chunk.PCM)
+			}
 			select {
 			case chunks <- chunk.PCM:
 			default:
@@ -482,9 +529,14 @@ func (s *Service) stop(ctx context.Context) error {
 	close(s.chunks)
 	s.waitNetwork(ctx, s.networkDone)
 	s.cancel()
+	if s.recorder != nil {
+		s.recorder.Close()
+		s.recorder = nil
+	}
 	s.mu.Lock()
-	incomplete := s.incomplete
+	incomplete := s.incomplete || s.needsRecovery
 	s.mu.Unlock()
+	s.retainOrUpload(context.Background(), snap.MeetingID, incomplete)
 	if incomplete {
 		if err := s.Store.MarkMeetingInterrupted(context.Background(), snap.MeetingID); err != nil {
 			s.fail(fmt.Errorf("mark interrupted meeting: %w", err))

@@ -112,5 +112,7 @@
   "menuStop": "Berhenti merekam",
   "menuQuit": "Keluar dari Titen",
   "tipPrefix": "Titen · {state}",
-  "tipMicTest": "Titen · Tes mikrofon aktif"
+  "tipMicTest": "Titen · Tes mikrofon aktif",
+  "retainFullAudio": "Simpan audio untuk transkripsi nanti",
+  "retainFullAudioHint": "Menyimpan audio rapat di perangkat ini dan mengunggahnya hanya saat transkripsi langsung tidak tersedia atau rapat disimpan untuk nanti."
 }

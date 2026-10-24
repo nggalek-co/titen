@@ -58,7 +58,7 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
-	if err := s.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS meetings(id TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL,data TEXT NOT NULL,start_ms INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL,text TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);`); err != nil {
+	if err := s.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS meetings(id TEXT PRIMARY KEY,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL,data TEXT NOT NULL,start_ms INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL,text TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS audio_chunks(id TEXT PRIMARY KEY,meeting_id TEXT NOT NULL,chunk_index INTEGER NOT NULL,start_ms INTEGER NOT NULL,duration_ms INTEGER NOT NULL,checksum TEXT NOT NULL,path TEXT NOT NULL,size_bytes INTEGER NOT NULL,state TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT 0); CREATE UNIQUE INDEX IF NOT EXISTS audio_chunks_meeting ON audio_chunks(meeting_id,chunk_index);`); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -315,6 +315,71 @@ func (s *Store) Retry(ctx context.Context, id string, attempts int, next time.Ti
 	return s.exec("UPDATE outbox SET attempts=?,next_at=? WHERE id=?", attempts, next.Unix(), id)
 }
 
+// AudioChunk mirrors one local WAV file's metadata. The file itself lives
+// in the app's private recordings directory; only metadata is in SQLite.
+type AudioChunk struct {
+	ID, MeetingID, Checksum, Path, State string
+	Index                                int
+	StartMS, DurationMS, SizeBytes       int64
+}
+
+func (s *Store) AddAudioChunk(ctx context.Context, c AudioChunk) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.exec("INSERT OR REPLACE INTO audio_chunks VALUES(?,?,?,?,?,?,?,?,?,?)", c.ID, c.MeetingID, c.Index, c.StartMS, c.DurationMS, c.Checksum, c.Path, c.SizeBytes, c.State, time.Now().Unix())
+}
+func (s *Store) AudioChunks(ctx context.Context, meetingID string) ([]AudioChunk, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, e := s.rows("SELECT id,meeting_id,chunk_index,start_ms,duration_ms,checksum,path,size_bytes,state FROM audio_chunks WHERE meeting_id=? ORDER BY chunk_index", meetingID)
+	if e != nil {
+		return nil, e
+	}
+	return scanChunks(r), nil
+}
+// PendingAudioUploads returns chunks still waiting on a remote copy across
+// every meeting, so an app restart resumes interrupted uploads.
+func (s *Store) PendingAudioUploads(ctx context.Context) ([]AudioChunk, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, e := s.rows("SELECT id,meeting_id,chunk_index,start_ms,duration_ms,checksum,path,size_bytes,state FROM audio_chunks WHERE state IN ('local_ready','uploading','failed') ORDER BY created_at")
+	if e != nil {
+		return nil, e
+	}
+	return scanChunks(r), nil
+}
+func (s *Store) SetAudioChunkState(ctx context.Context, id, state string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.exec("UPDATE audio_chunks SET state=? WHERE id=?", state, id)
+}
+// RecoverAudioChunks settles rows left mid-write by a crash: 'capturing'
+// means the file was sealed before the process stopped only when the next
+// index exists — simpler and safer to treat every interrupted row as
+// ready-to-upload, since the writer seals files before registering them.
+func (s *Store) RecoverAudioChunks(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.exec("UPDATE audio_chunks SET state='local_ready' WHERE state IN ('capturing','uploading')")
+}
+func (s *Store) Meeting(ctx context.Context, id string) (Meeting, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.meeting(id)
+}
+func scanChunks(r [][]string) []AudioChunk {
+	var out []AudioChunk
+	for _, row := range r {
+		var c AudioChunk
+		c.ID, c.MeetingID, c.Checksum, c.Path, c.State = row[0], row[1], row[5], row[6], row[8]
+		fmt.Sscan(row[2], &c.Index)
+		fmt.Sscan(row[3], &c.StartMS)
+		fmt.Sscan(row[4], &c.DurationMS)
+		fmt.Sscan(row[7], &c.SizeBytes)
+		out = append(out, c)
+	}
+	return out
+}
 func (s *Store) RequestDocument(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

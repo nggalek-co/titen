@@ -112,5 +112,7 @@
   "menuStop": "Stop recording",
   "menuQuit": "Quit Titen",
   "tipPrefix": "Titen · {state}",
-  "tipMicTest": "Titen · Microphone test active"
+  "tipMicTest": "Titen · Microphone test active",
+  "retainFullAudio": "Save audio for later transcription",
+  "retainFullAudioHint": "Keeps meeting audio on this device and uploads it only when live transcription is unavailable or the meeting is saved for later."
 }

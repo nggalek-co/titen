@@ -1027,6 +1027,10 @@ func (d *desktop) settingsView(c *ui.Context) {
 						{Value: "System audio only", Label: d.tr(c, "captureSystem")},
 					}).Trigger.FillWidth().Label(d.tr(c, "audioSources"))
 				})
+				ui.Column(c).Gap(4).Children(func() {
+					components.Checkbox(c.Key("retain-audio"), &d.settings.RetainFullAudio, "").Label(d.tr(c, "retainFullAudio")).Disabled(d.busy || d.snapshot.State != app.Idle && d.snapshot.State != app.Paused)
+					components.Text(c, d.tr(c, "retainFullAudioHint")).FontSize(11).TextColor(t.TextMuted)
+				})
 				ui.Column(c).Gap(5).Children(func() {
 					components.Text(c, d.tr(c, "helperExe")).FontSize(12).FontWeight(600)
 					components.TextBox(c.Key("helper"), &d.settings.HelperPath, components.TextBoxOptions{}).Label(d.tr(c, "helperExe"))
@@ -1262,6 +1266,10 @@ func main() {
 	endpoint := cfg.ServerEndpoint
 	token, _ := auth.GetSecret(saas.TokenKey(endpoint))
 	d := &desktop{service: app.NewService(store), store: store, dir: dir, settings: cfg, endpointInput: endpoint, deviceToken: token, page: "Record", root: ctx, cancel: cancel, microphone: "System default"}
+	d.service.RecordingsDir = filepath.Join(dir, "recordings")
+	if token != "" {
+		go d.service.ResumeAudioUploads(ctx, &saas.Client{BaseURL: endpoint, Token: token})
+	}
 	d.liveList.FollowEnd = true
 	if cfg.MicrophoneID != "" {
 		d.microphone = cfg.MicrophoneID
