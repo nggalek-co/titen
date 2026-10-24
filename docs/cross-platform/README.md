@@ -1,6 +1,6 @@
 # Cross-platform desktop builds
 
-This change ports the existing recorder to macOS and Windows. It does not implement the SaaS backend described in PRD 002.
+This change ports the existing recorder to macOS and Windows. The web UI and SaaS backend live in the separate [titen-web repository](../../../titen-web), which owns [PRD 002](../../../titen-web/docs/prd/002.md). The desktop stores an endpoint and device token, authorizes transcription sessions, and streams audio to this API.
 
 ## Shared code and platform ownership
 

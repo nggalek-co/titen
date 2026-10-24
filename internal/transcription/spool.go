@@ -96,3 +96,7 @@ func spool(ctx context.Context, audio <-chan []byte, failed func(error)) (<-chan
 	cleanup := func() { cancel(); workers.Wait(); file.Close() }
 	return out, cleanup, nil
 }
+
+func Spool(ctx context.Context, audio <-chan []byte, failed func(error)) (<-chan []byte, func(), error) {
+	return spool(ctx, audio, failed)
+}

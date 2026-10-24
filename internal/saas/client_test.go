@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -227,6 +228,422 @@ func TestStreamAudioThenEnd(t *testing.T) {
 	})
 	if err != nil || !synced.Load() || !ended.Load() {
 		t.Fatalf("sync=%v end=%v err=%v", synced.Load(), ended.Load(), err)
+	}
+}
+
+func TestStreamMeetingRenewsWithoutClosingMeeting(t *testing.T) {
+	var grants atomic.Int32
+	var audioBytes atomic.Int32
+	var synced []cloudSegment
+	var ended []string
+	var mu sync.Mutex
+	oldFinishing := make(chan struct{})
+	client := directTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Error(err)
+			return
+		}
+		for {
+			kind, data, err := conn.ReadMessage()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if kind == websocket.TextMessage && len(data) == 0 {
+				if key != "second-key" {
+					close(oldFinishing)
+					time.Sleep(500 * time.Millisecond)
+				}
+				text := "first"
+				if key == "second-key" {
+					text = "second"
+				}
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"tokens":[{"text":"`+text+`","is_final":true,"start_ms":10,"end_ms":20}],"finished":true}`))
+				return
+			}
+			if kind == websocket.BinaryMessage {
+				audioBytes.Add(int32(len(data)))
+			}
+		}
+	}, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/transcription-sessions":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["meetingId"] != "m" {
+				t.Errorf("renewal meeting ID %q", body["meetingId"])
+			}
+			grants.Add(1)
+			s := directSession()
+			s.SessionID = "s2"
+			s.TemporaryAPIKey = "second-key"
+			_ = json.NewEncoder(w).Encode(s)
+		case r.URL.Path == "/api/heartbeat":
+			var body struct {
+				Segments []cloudSegment `json:"segments"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			synced = append(synced, body.Segments...)
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.HasSuffix(r.URL.Path, "/end"):
+			mu.Lock()
+			ended = append(ended, r.URL.Path)
+			mu.Unlock()
+			w.WriteHeader(204)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	})
+	initial := directSession()
+	initial.MaxSessionDurationSeconds = 91
+	initial.ExpiresAt = time.Now().Add(100 * time.Millisecond)
+	audio := make(chan []byte, 1002)
+	audio <- make([]byte, 3200)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	switched := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		finished <- client.StreamMeeting(ctx, initial, audio, nil, func(id string) {
+			if id == "s2" {
+				close(switched)
+			}
+		})
+	}()
+	select {
+	case <-oldFinishing:
+	case <-ctx.Done():
+		t.Fatal("old grant did not finish")
+	}
+	for range 500 {
+		audio <- []byte{3, 0}
+	}
+	select {
+	case <-switched:
+	case <-ctx.Done():
+		t.Fatal("grant did not renew")
+	}
+	audio <- []byte{2, 0}
+	close(audio)
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if grants.Load() != 1 || len(ended) != 1 || ended[0] != "/api/transcription-sessions/s2/end" {
+		t.Fatalf("grants=%d ended=%v", grants.Load(), ended)
+	}
+	if audioBytes.Load() != 4202 {
+		t.Fatalf("audio lost during grant handoff: got %d bytes", audioBytes.Load())
+	}
+	if len(synced) != 2 || synced[0].Seq != 1 || synced[1].Seq != 2 || synced[1].StartMS <= synced[0].EndMS {
+		t.Fatalf("transcript sequence or meeting time reset: %+v", synced)
+	}
+}
+
+func TestStreamMeetingRetriesBackendUploadWhileProviderContinues(t *testing.T) {
+	var uploads atomic.Int32
+	var audioBytes atomic.Int32
+	var ended atomic.Bool
+	firstAudio := make(chan struct{})
+	client := directTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Error(err)
+			return
+		}
+		for {
+			kind, data, err := conn.ReadMessage()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if kind == websocket.BinaryMessage {
+				audioBytes.Add(int32(len(data)))
+				if audioBytes.Load() == 2 {
+					close(firstAudio)
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"tokens":[{"text":"saved","is_final":true,"start_ms":1,"end_ms":2}]}`))
+				}
+			}
+			if kind == websocket.TextMessage && len(data) == 0 {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"finished":true}`))
+				return
+			}
+		}
+	}, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/heartbeat":
+			var body struct {
+				Segments []cloudSegment `json:"segments"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if len(body.Segments) != 1 || body.Segments[0].Seq != 1 {
+				t.Errorf("unexpected retry payload %+v", body.Segments)
+			}
+			if uploads.Add(1) == 1 {
+				w.WriteHeader(503)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/api/transcription-sessions/s/end":
+			ended.Store(true)
+			w.WriteHeader(204)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	})
+	client.syncInterval = 10 * time.Millisecond
+	audio := make(chan []byte, 2)
+	audio <- []byte{1, 0}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() { finished <- client.StreamMeeting(ctx, directSession(), audio, nil, nil) }()
+	select {
+	case <-firstAudio:
+	case <-ctx.Done():
+		t.Fatal("provider did not receive audio")
+	}
+	deadline := time.After(2 * time.Second)
+	for uploads.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("transcript upload was not retried")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	audio <- []byte{2, 0}
+	close(audio)
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+	if audioBytes.Load() != 4 || !ended.Load() {
+		t.Fatalf("provider audio=%d ended=%v", audioBytes.Load(), ended.Load())
+	}
+}
+
+func TestStreamMeetingReconnectsAndSendsAudioBufferedDuringOutage(t *testing.T) {
+	var connections, renewals atomic.Int32
+	var synced []cloudSegment
+	var statuses []transcription.ConnectionStatus
+	var ended []string
+	var mu sync.Mutex
+	renewalStarted := make(chan struct{})
+	client := directTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		connections.Add(1)
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Error(err)
+			return
+		}
+		kind, data, err := conn.ReadMessage()
+		if err != nil || kind != websocket.BinaryMessage {
+			t.Errorf("audio=%q kind=%d err=%v", data, kind, err)
+			return
+		}
+		if key == "temporary-secret" {
+			if len(data) != 3200 {
+				t.Errorf("first audio bytes=%d", len(data))
+			}
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"tokens":[{"text":"first","is_final":true,"start_ms":0,"end_ms":20}]}`))
+			return
+		}
+		if key != "renewed-key" || string(data) != "\x02\x00" {
+			t.Errorf("renewed key=%q audio=%q", key, data)
+			return
+		}
+		kind, data, err = conn.ReadMessage()
+		if err != nil || kind != websocket.TextMessage || len(data) != 0 {
+			t.Errorf("end=%q kind=%d err=%v", data, kind, err)
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"tokens":[{"text":"second","is_final":true,"start_ms":0,"end_ms":20}],"finished":true}`))
+	}, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/transcription-sessions":
+			switch renewals.Add(1) {
+			case 1:
+				close(renewalStarted)
+				w.WriteHeader(503)
+				return
+			case 2:
+				w.WriteHeader(409)
+				return
+			}
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["meetingId"] != "m" {
+				t.Errorf("renewal meeting=%q", body["meetingId"])
+			}
+			s := directSession()
+			s.SessionID = "s2"
+			s.TemporaryAPIKey = "renewed-key"
+			_ = json.NewEncoder(w).Encode(s)
+		case r.URL.Path == "/api/heartbeat":
+			var body struct {
+				Segments []cloudSegment `json:"segments"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			synced = append(synced, body.Segments...)
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.HasSuffix(r.URL.Path, "/end"):
+			mu.Lock()
+			ended = append(ended, r.URL.Path)
+			mu.Unlock()
+			w.WriteHeader(204)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	})
+	audio := make(chan []byte, 2)
+	audio <- make([]byte, 3200)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() {
+		finished <- client.StreamMeeting(ctx, directSession(), audio, func(update transcription.Update) {
+			if update.ConnectionStatus != transcription.ConnectionUnknown {
+				mu.Lock()
+				statuses = append(statuses, update.ConnectionStatus)
+				mu.Unlock()
+			}
+		}, nil)
+	}()
+	select {
+	case <-renewalStarted:
+	case err := <-finished:
+		t.Fatalf("recording stopped on disconnect: %v", err)
+	case <-ctx.Done():
+		t.Fatal("provider did not request a new grant")
+	}
+	audio <- []byte{2, 0}
+	close(audio)
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if connections.Load() != 2 || renewals.Load() != 3 || len(ended) != 1 || ended[0] != "/api/transcription-sessions/s2/end" {
+		t.Fatalf("connections=%d renewals=%d ended=%v", connections.Load(), renewals.Load(), ended)
+	}
+	if len(synced) != 2 || synced[0].Text != "first" || synced[1].Text != "second" || synced[0].Seq != 1 || synced[1].Seq != 2 || synced[1].StartMS != 100 {
+		t.Fatalf("lost transcript across reconnect: %+v", synced)
+	}
+	if len(statuses) != 3 || statuses[0] != transcription.ConnectionConnected || statuses[1] != transcription.ConnectionReconnecting || statuses[2] != transcription.ConnectionConnected {
+		t.Fatalf("unexpected connection status sequence: %v", statuses)
+	}
+}
+
+func TestStreamMeetingStopsWhenRenewalRejectsCredit(t *testing.T) {
+	var renewals, ends atomic.Int32
+	client := directTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		_, _, _ = conn.ReadMessage()
+	}, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/transcription-sessions" {
+			renewals.Add(1)
+			w.WriteHeader(402)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/end") {
+			ends.Add(1)
+			w.WriteHeader(204)
+			return
+		}
+		t.Errorf("unexpected request %s", r.URL.Path)
+		w.WriteHeader(404)
+	})
+	audio := make(chan []byte, 1)
+	audio <- []byte{1, 0}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	err := client.StreamMeeting(ctx, directSession(), audio, nil, nil)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 402 || renewals.Load() != 1 || ends.Load() != 1 {
+		t.Fatalf("renewals=%d ends=%d err=%v", renewals.Load(), ends.Load(), err)
+	}
+}
+
+func TestStreamMeetingCancellationStopsReconnect(t *testing.T) {
+	var renewals, ends atomic.Int32
+	renewalStarted := make(chan struct{})
+	client := directTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		_, _, _ = conn.ReadMessage()
+	}, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/transcription-sessions" {
+			if renewals.Add(1) == 1 {
+				close(renewalStarted)
+			}
+			w.WriteHeader(503)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/end") {
+			ends.Add(1)
+			w.WriteHeader(204)
+			return
+		}
+		t.Errorf("unexpected request %s", r.URL.Path)
+		w.WriteHeader(404)
+	})
+	audio := make(chan []byte, 1)
+	audio <- []byte{1, 0}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() { finished <- client.StreamMeeting(ctx, directSession(), audio, nil, nil) }()
+	select {
+	case <-renewalStarted:
+	case err := <-finished:
+		t.Fatalf("recording stopped before cancellation: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("provider did not start reconnecting")
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) || ends.Load() != 1 {
+			t.Fatalf("ends=%d err=%v", ends.Load(), err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation did not stop reconnect")
 	}
 }
 

@@ -53,6 +53,89 @@ func TestDurableTranscriptAndOutbox(t *testing.T) {
 		t.Fatalf("search %v %v", meetings, e)
 	}
 }
+
+func TestInterruptedMeetingRecoveryPreservesTranscript(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "meetings.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interrupted, err := s.CreateMeeting(ctx, "Interrupted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := s.CreateMeeting(ctx, "Completed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddSegments(ctx, []transcript.Segment{{MeetingID: interrupted.ID, Text: "saved words", EndMS: 1200}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishMeeting(ctx, completed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.RecoverInterruptedMeetings(ctx); err != nil {
+		t.Fatal(err)
+	}
+	meetings, err := s.Meetings(ctx, "")
+	if err != nil || len(meetings) != 2 {
+		t.Fatalf("meetings=%v error=%v", meetings, err)
+	}
+	var firstInterruptedAt time.Time
+	for _, m := range meetings {
+		if m.ID == interrupted.ID {
+			if m.InterruptedAt == nil || m.EndedAt != nil {
+				t.Fatalf("interrupted meeting marked complete: %+v", m)
+			}
+			firstInterruptedAt = *m.InterruptedAt
+		} else if m.InterruptedAt != nil || m.EndedAt == nil {
+			t.Fatalf("completed meeting changed: %+v", m)
+		}
+	}
+	if err := s.RecoverInterruptedMeetings(ctx); err != nil {
+		t.Fatal(err)
+	}
+	meetings, err = s.Meetings(ctx, "Interrupted")
+	if err != nil || len(meetings) != 1 || meetings[0].InterruptedAt == nil || !meetings[0].InterruptedAt.Equal(firstInterruptedAt) {
+		t.Fatalf("repeat recovery changed state: %+v %v", meetings, err)
+	}
+	segments, err := s.Segments(ctx, interrupted.ID)
+	if err != nil || len(segments) != 1 || segments[0].Text != "saved words" {
+		t.Fatalf("saved transcript changed: %+v %v", segments, err)
+	}
+}
+
+func TestFailedFinalizationStaysIncompleteAfterMeetingEnds(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	m, err := s.CreateMeeting(ctx, "Finalization failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkMeetingInterrupted(ctx, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishMeeting(ctx, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	meetings, err := s.Meetings(ctx, "")
+	if err != nil || len(meetings) != 1 || meetings[0].EndedAt == nil || meetings[0].InterruptedAt == nil {
+		t.Fatalf("failed finalization looks complete: %+v %v", meetings, err)
+	}
+}
 func TestRetryPreservesOrderAndMeetingIdentity(t *testing.T) {
 	ctx := context.Background()
 	s, e := Open(":memory:")

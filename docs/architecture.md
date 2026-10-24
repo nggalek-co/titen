@@ -42,7 +42,7 @@ Two application structures were compared independently. A service with snapshots
 - internal/sync owns four second outbox polling, retry scheduling, and Google document updates.
 - main.go owns native views and menu bar actions. UI drafts belong to the UI thread. Slow work runs outside rendering.
 
-The recording states are Ready, Starting, Recording, Paused and Finishing. Pause terminates native capture while leaving the meeting and transcription session open. Resume launches capture with the saved microphone choice. Stop closes capture, drains native sample and writer queues, signals Soniox end-of-stream, and allows up to 15 seconds for final transcription before marking the meeting complete. A longer outage can leave unfinalized audio missing. Native stream interruptions retry capture up to three times within the same meeting; permission failure ends the meeting with an actionable error. A paused meeting can apply a different microphone or source mode before resuming.
+The recording states are Ready, Starting, Recording, Paused and Finishing. Pause terminates native capture while leaving the meeting and transcription session open. Resume launches capture with the saved microphone choice. Stop closes capture, drains native sample and writer queues, signals Soniox end-of-stream, and allows up to 15 seconds for final transcription before marking the meeting complete. A longer outage can leave unfinalized audio missing. Native capture interruptions retry with increasing delays until capture restarts or the user stops; permission failure ends the meeting with an actionable error. A paused meeting can apply a different microphone or source mode before resuming.
 
 ## Audio transport and processing
 
@@ -50,7 +50,9 @@ The helper emits source-tagged frames with timestamps, rate, channel count, samp
 
 Headphones do not change the system playback capture path. They reduce microphone pickup of playback. Mixed mode does not provide acoustic echo cancellation. Separate provider sessions remain a future mode because frames retain source identity before mixing.
 
-Queues are bounded. Overload can discard frames and must be treated as incomplete audio. Provider reconnection does not replay unconfirmed audio, which avoids replay duplicates but may lose speech during an outage. A private, unlinked disk spool preserves unsent PCM during a running session, with a 1 GiB total meeting limit. It retains audio until session cleanup and cannot recover audio after process exit. Finalized text, pending document creation and pending cloud operations survive restarts.
+Queues are bounded. Overload can discard frames and must be treated as incomplete audio. During a provider outage, a private, unlinked disk spool preserves unsent PCM up to 1 GiB, and the client reconnects to the same meeting with a renewed grant. The backend's 409 renewal guard can delay reconnection until the current 10-minute grant is within its 90-second renewal lead. WebSocket audio writes have no delivery acknowledgement: the failed write is retried, but a write accepted by the local socket immediately before disconnect may be missing or duplicated. The spool is deleted at session cleanup and cannot recover audio after process exit. Finalized segments are saved to SQLite as they arrive; startup recovers unfinished meetings as interrupted.
+
+Unexpected audio-helper exits retry with increasing delays until capture restarts or the user stops the meeting. This supports recovery after wake, but no audio can be captured while the computer sleeps; the meeting is marked incomplete to preserve that fact. Closing the window hides the app and leaves the service running.
 
 ## Permissions, packaging, and security
 

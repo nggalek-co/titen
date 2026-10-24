@@ -1,8 +1,10 @@
 # Titen
 
-Titen is a native desktop meeting transcription application for macOS and Windows built with MyGo native GPU widgets, Go, and platform-specific native capture helpers. It captures microphone and playback audio, streams mixed speech to Soniox, saves finalized transcripts in SQLite, and synchronizes them to Google Docs.
+Titen is a native desktop meeting transcription application for macOS and Windows built with MyGo native GPU widgets, Go, and platform-specific native capture helpers. It captures microphone and playback audio, streams mixed speech directly to Soniox with a temporary key issued by Titen, and saves finalized transcripts in SQLite.
 
-The macOS application builds locally. Windows builds and tests run on GitHub-hosted Windows runners. Live capture and provider acceptance remain unverified in this environment. Read [verification results](docs/verification.md) before relying on it for a meeting.
+The macOS application builds locally. Windows builds and tests run on GitHub-hosted Windows runners. Live capture and hosted provider acceptance remain unverified in this environment. Read [verification results](docs/verification.md) before relying on it for a meeting.
+
+The web UI and SaaS backend are implemented separately in [titen-web](../titen-web), which also owns [PRD 002](../titen-web/docs/prd/002.md). It contains account management, prepaid billing, device authorization, transcription sessions, and Google integration. The desktop signs in through the web account, requests temporary Soniox credentials, and uploads finalized transcript segments through authenticated heartbeats. See [direct streaming](docs/saas-integration/direct-soniox.md) for the matching backend contract and billing limits.
 
 ## Build and run on macOS
 
@@ -51,19 +53,13 @@ macOS packages are ad hoc signed for local testing. Windows packages are unsigne
 
 See [cross-platform architecture and verification](docs/cross-platform/README.md).
 
-## Configure transcription and Google Docs
+## Connect the desktop to Titen
 
-1. Open **Settings** and enter your Soniox API key.
-2. Create a Google Cloud desktop OAuth client. Enable the Google Docs API and configure the OAuth consent screen. Add your account as a test user if the consent screen is in testing.
-3. Enter the desktop OAuth client ID and its client secret in **Settings**. Save the settings.
-4. Click **Connect Google** and complete authorization in your system browser.
-5. Return to **Record**, enter a meeting title, and click **Start recording**.
+Open **Settings** and set **Server endpoint**. Local development defaults to `http://localhost:3000`. Hosted endpoints must use HTTPS. Save settings, then click **Sign in with browser** and approve the displayed code. The desktop stores its device token in Keychain or Windows Credential Manager, scoped to that endpoint.
 
-Keys, OAuth client secrets, access tokens, and refresh tokens use macOS Keychain or Windows Credential Manager. The client ID and audio preferences are ordinary local settings. `GOOGLE_CLIENT_SECRET` optionally overrides the saved OAuth client secret for development. Environment variables set in a terminal do not automatically reach an app launched from Finder.
+Start a meeting as usual. Titen reserves account credit before capture, sends 16 kHz mono audio directly to Soniox, and saves finalized transcript segments locally. The backend retains the long-lived Soniox key and issues a single-use temporary key for each recording session. It reconciles charges from provider usage records. Unused reserved credit remains held until reconciliation. Open **Open billing** or **Google settings** in the browser to manage account credit and Google access.
 
-OAuth requests the [drive.file scope recommended by Google](https://developers.google.com/workspace/docs/api/auth). An optional existing document ID must refer to a document already authorized for this app. Pasting an arbitrary document ID does not grant access. A Drive picker is not included. Leave the ID empty to create a new document automatically.
-
-Document creation and transcript synchronization retry independently of recording. Finalized text reaches SQLite before it can enter a Google Docs batch. Titen checks document access before attachment. Existing documents cannot be reassigned once attached to a meeting because the checkpoints belong to that document. An ambiguous successful document-creation response can leave an orphan document; append reconciliation prevents duplicate text in the attached document.
+The `server_endpoint` setting is stored in the local `settings.json` file. Device tokens remain in the operating system credential store.
 
 ## Record a meeting
 
@@ -71,7 +67,7 @@ On Windows, enable desktop microphone access in Windows Settings under Privacy &
 
 Approve microphone and Screen & System Audio Recording permission when macOS requests them. If access fails, open **System Settings > Privacy & Security**, grant access to Titen, and start again.
 
-The main window shows recording state, elapsed recording time, separate audio meters, finalized text, partial speech, and cloud sync status. The live view retains the latest 500 finalized segments. Complete transcripts remain in **History**.
+The main window shows recording state, elapsed recording time, separate audio meters, finalized text, and partial speech. The live view retains the latest 500 finalized segments. Complete transcripts remain in **History**.
 
 Closing the window hides it. Recording continues. The menu bar provides start, pause, resume, stop, open, and quit actions. Quit ends capture and allows up to 15 seconds for final transcription before leaving.
 
@@ -81,19 +77,23 @@ In **Settings**, click **Test microphone for 10 seconds** to check the selected 
 
 Use headphones to reduce playback leakage into the microphone. Titen does not provide acoustic echo cancellation. System playback capture does not require a virtual loopback driver.
 
-## Read transcripts offline
+## Read transcripts locally
 
-Open **History**, search meeting titles or transcript text, and select a meeting. Use **Copy transcript** or **Open Google Doc**. If automatic document creation is disabled, you can attach an app-authorized document ID later.
+Open **History**, search meeting titles or transcript text, and select a meeting. Use **Copy transcript** or **Open Titen meeting** to view the server copy and Google Docs.
 
-Data lives in `~/Library/Application Support/Titen/` on macOS and `%AppData%\Titen\` on Windows. SQLite contains meetings, speaker and timestamp metadata, finalized segments, and the durable synchronization outbox. The settings file contains preferences. Back up the whole directory while Titen is stopped if you need a consistent manual copy. Keychain credentials are separate from that directory.
+Data lives in `~/Library/Application Support/Titen/` on macOS and `%AppData%\Titen\` on Windows. SQLite contains local meetings, speaker and timestamp metadata, and finalized segments. The settings file contains the endpoint and audio preferences. Back up the whole directory while Titen is stopped if you need a consistent manual copy. Device credentials are separate from that directory.
 
 ## Understand recovery limits
 
-Unsent audio is buffered in a private temporary disk file with automatic cleanup during an active session. The total spool limit is 1 GiB. It is removed at session cleanup and cannot recover audio after an application crash. Audio already sent without confirmation can be lost after a provider disconnect. The UI reports disconnections and buffer overflow.
+Capture starts as soon as **Record** is clicked, before the server authorization request finishes. Titen buffers about 25 seconds of startup audio while it waits for that request. During a running session, unsent PCM is buffered in a private temporary disk file (1 GiB maximum). The UI shows whether transcription is connecting, connected, or reconnecting; it also reports when capture is being restarted.
 
-Native stream interruptions trigger at most three capture restarts within the same meeting. Permission failures require correction in System Settings. A temporary Google outage retains document creation requests and transcript batches across application restarts. Ambiguous append responses are reconciled using atomic named ranges and revision checks. Keep the app's named ranges in the document intact.
+Closing the window only hides Titen. Unexpected audio-helper exits trigger automatic capture retries with increasing delays until capture is available or you stop the session. The computer cannot record while asleep; speech during sleep is missing, and the meeting is marked incomplete even if capture resumes after wake. Check microphone and screen-audio permissions if recovery does not succeed.
 
-Stop allows 15 seconds to finalize transcription. A longer outage can leave unfinalized speech missing. Completed local transcripts remain available even when Google synchronization fails. Neither the SQLite outbox nor the temporary audio spool is a full audio recording archive.
+After a Soniox disconnect, Titen keeps recording and buffers unsent audio while it requests a fresh grant for the same meeting. The server can reject that renewal with HTTP 409 until the existing grant is within its renewal window (up to about 9.5 minutes for the current 10-minute grant). A successful WebSocket write has no delivery acknowledgement, so a chunk at the moment of disconnect can be missing or duplicated. The 1 GiB spool is deleted at session cleanup and cannot recover audio after an application crash.
+
+Finalized transcript segments are saved locally as they arrive and survive an app restart. Startup marks a meeting interrupted if the app exits before the session finishes. Unfinalized speech and the temporary audio spool do not survive a crash. Stop allows up to 15 seconds for final transcription; a longer outage can leave speech missing.
+
+This spool is a recovery buffer, not a full audio recording archive.
 
 ## Verify changes
 
@@ -108,9 +108,34 @@ See [architecture](docs/architecture.md), [verification results](docs/verificati
 
 ## Troubleshoot
 
+- Startup checks inspect the selected audio mode and account access. Recording and resume stay disabled until those checks pass. Use **Request access** to show macOS permission prompts, then **Recheck** after changing permissions. Settings, logs, and stop controls remain available.
+- Local macOS builds use ad hoc signing by default. Rebuilding changes the signing hash, so an enabled entry in System Settings can refer to an earlier build. Approve access for the current build and restart Titen if macOS requests it. Set `TITEN_CODESIGN_IDENTITY` to an installed signing identity when building for a stable certificate identity.
+- In **Settings → Open logs**, locate `titen.log` and attach it when reporting a problem. Logs persist across app restarts in the Titen config directory (`~/Library/Application Support/Titen/logs/` on macOS). Each line is a JSON event written with Go's `log/slog`, including timestamps and audio helper failure details. Audio samples and transcript content are not logged.
 - If the helper cannot start, rebuild the bundle and check its path in **Settings**.
 - If either meter stays at zero, check permission, source mode, microphone selection, and whether the meeting is producing playback audio.
-- If Google returns 403, verify the Docs API, consent test user, and per-document authorization. A successful Google browser login alone does not prove document access.
 - If Keychain access fails, approve access for the locally signed app. Rebuilding with a different signing identity can change Keychain authorization behavior.
 - If a build reports a module-cache permission error, use the build script. It places Go, Swift, and Clang caches in the writable project cache directory.
 - If a transcript is incomplete after an outage, inspect the visible error before starting another session. Unfinalized audio cannot be reconstructed from finalized text.
+
+### macOS permission enabled, but startup check still fails
+
+An enabled **Screen & System Audio Recording** toggle can refer to an older ad hoc signed build. Logs may report `com.apple.ScreenCaptureKit.SCStreamErrorDomain (-3801): The user declined TCCs for application, window, display capture` even though the toggle is on.
+
+To refresh access for the current build:
+
+1. Stop any active recording and quit Titen completely using **Titen > Quit Titen**. Closing the window only hides it.
+2. Open **System Settings > Privacy & Security > Screen & System Audio Recording**.
+3. Select the Titen entry and remove it with the minus button.
+4. Click the plus button and select the exact app bundle you intend to run, such as this repository's `build/Titen.app`.
+5. Ensure its toggle is on, authenticate if requested, and choose **Quit & Reopen** if offered. Otherwise, launch that app bundle yourself.
+6. Confirm the startup warning disappears and **Start recording** becomes enabled. Use **Recheck** if needed. This verifies the permission check; verify live capture separately before a meeting.
+
+To reduce permission resets after rebuilding, use the same persistent code-signing certificate for every build instead of the default ad hoc signature:
+
+```sh
+# List installed code-signing identities, then use the exact certificate name.
+security find-identity -v -p codesigning
+TITEN_CODESIGN_IDENTITY='Your installed signing certificate name' sh scripts/build-macos.sh
+```
+
+The build script signs both the app and `titen-audio` helper with that identity. Keep the certificate, bundle identifiers (`co.nggalek.titen` and `co.nggalek.titen.audio`), and launch location consistent. A persistent local code-signing certificate is an option for development on your Mac; use Apple Developer ID signing and notarization for distribution. Certificate signing reduces identity changes but does not guarantee macOS will never request consent again. After changing signing identities, refresh the permission entry once using the steps above.

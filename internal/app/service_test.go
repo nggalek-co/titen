@@ -2,6 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -51,6 +54,65 @@ func awaitIdle(t *testing.T, s *Service) {
 	t.Fatalf("meeting did not finish: %+v", s.Snapshot())
 }
 
+func serviceAudioFrames() []byte {
+	const samples = 1600
+	frames := make([]byte, 0, 20*(24+samples*2))
+	for i := 0; i < 20; i++ {
+		frame := make([]byte, 24+samples*2)
+		copy(frame[:4], "TIT1")
+		frame[4], frame[5] = 1, 1
+		binary.LittleEndian.PutUint16(frame[6:8], 1)
+		binary.LittleEndian.PutUint32(frame[8:12], 16000)
+		binary.LittleEndian.PutUint64(frame[12:20], uint64(time.Duration(i)*100*time.Millisecond))
+		binary.LittleEndian.PutUint32(frame[20:24], samples*2)
+		frames = append(frames, frame...)
+	}
+	return frames
+}
+
+func TestStartCapturesBeforeRemoteAuthorization(t *testing.T) {
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{Frames: serviceAudioFrames()})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	s.authorize = func(context.Context, *saas.Client, string) (saas.Session, error) {
+		close(entered)
+		<-release
+		return saas.Session{}, nil
+	}
+
+	started := make(chan error, 1)
+	go func() { started <- s.Start(context.Background(), cfg, "key", "meeting") }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("authorization was not reached")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(cfg.HelperPath + ".args"); err == nil && len(s.chunks) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(cfg.HelperPath + ".args"); err != nil || len(s.chunks) == 0 || s.Snapshot().State != Recording || s.Snapshot().TranscriptionStatus != transcription.ConnectionConnecting {
+		t.Fatalf("audio was not captured while authorization was pending: state=%s status=%d buffered=%d", s.Snapshot().State, s.Snapshot().TranscriptionStatus, len(s.chunks))
+	}
+	close(release)
+	released = true
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCaptureFailureFinishesAndAllowsRestart(t *testing.T) {
 	s, cfg := serviceFixture(t, testhelper.CaptureConfig{Stderr: "permission denied\n", ExitImmediately: true, ExitCode: 1})
 	ctx := context.Background()
@@ -69,6 +131,21 @@ func TestCaptureFailureFinishesAndAllowsRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	awaitIdle(t, s)
+}
+
+func TestStreamFailureMarksMeetingInterrupted(t *testing.T) {
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{})
+	s.run = func(ctx context.Context, chunks <-chan []byte, notify func(transcription.Update)) error {
+		return errors.New("provider disconnected")
+	}
+	if err := s.Start(context.Background(), cfg, "key", "interrupted"); err != nil {
+		t.Fatal(err)
+	}
+	awaitIdle(t, s)
+	meetings, err := s.Store.Meetings(context.Background(), "")
+	if err != nil || len(meetings) != 1 || meetings[0].InterruptedAt == nil {
+		t.Fatalf("meeting interruption not saved: meetings=%+v err=%v", meetings, err)
+	}
 }
 
 func TestPauseResumeAndStopDrainsDeduplicatedFinals(t *testing.T) {
@@ -146,18 +223,17 @@ func TestStopBoundsUncooperativeNetworkAndRejectsLateUpdate(t *testing.T) {
 }
 
 func TestCaptureInterruptionRecoversSameMeeting(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "interrupted")
-	s, cfg := serviceFixture(t, testhelper.CaptureConfig{InterruptMarker: marker})
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{Interruptions: 2})
 	ctx := context.Background()
 	if err := s.Start(ctx, cfg, "key", "meeting"); err != nil {
 		t.Fatal(err)
 	}
 	id := s.Snapshot().MeetingID
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	recovered := false
 	for time.Now().Before(deadline) {
 		s.op.Lock()
-		recovered = s.captureRestarts == 1
+		recovered = s.captureRestarts == 2
 		s.op.Unlock()
 		if recovered && s.Snapshot().State == Recording {
 			break
@@ -182,6 +258,10 @@ func TestCaptureInterruptionRecoversSameMeeting(t *testing.T) {
 	}
 	if err := s.Stop(ctx); err != nil {
 		t.Fatal(err)
+	}
+	meetings, err := s.Store.Meetings(ctx, "")
+	if err != nil || len(meetings) != 1 || meetings[0].InterruptedAt == nil {
+		t.Fatalf("recovered gap was not marked incomplete: meetings=%+v err=%v", meetings, err)
 	}
 }
 

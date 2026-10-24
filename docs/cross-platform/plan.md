@@ -39,4 +39,4 @@ SQLite alternatives were bundled Cgo SQLite and modernc SQLite through database/
 - [x] Run GitHub Actions on the feature branch and inspect downloadable artifacts.
 - [x] Review code, workflow permissions, packaging, and acceptance limits.
 
-The SaaS backend in PRD 002 remains a separate implementation. This work ports the existing desktop application and release process.
+The web UI and SaaS backend are implemented in [titen-web](../../../titen-web), which owns [PRD 002](../../../titen-web/docs/prd/002.md). This work ports the existing desktop application and release process. The desktop integration lives in internal/saas and uses the server endpoint saved in Settings.

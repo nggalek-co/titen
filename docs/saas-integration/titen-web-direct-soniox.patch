@@ -1,0 +1,2745 @@
+diff --git a/.env.example b/.env.example
+--- a/.env.example
++++ b/.env.example
+@@ -10,9 +10,10 @@
+ PAYMENT_DEV_SECRET=dev-webhook-secret
+ DEV_CREDIT_UNITS= # e.g. 10000000; enables POST /api/dev/grant-credit
+ 
+-# Transcription provider — unset uses the dev echo upstream
++# Transcription provider. Required for direct desktop sessions.
+ SONIOX_API_KEY=
+-SONIOX_WS_URL= # optional override
++SONIOX_WS_URL= # legacy proxy override only
++TRANSCRIPTION_RECONCILE_TOKEN= # service bearer token for POST /api/internal/transcription-usage
+ 
+ # Google Docs sync — unset returns 503 on connect
+ GOOGLE_CLIENT_ID=
+diff --git a/docs/api/device.yaml b/docs/api/device.yaml
+--- a/docs/api/device.yaml
++++ b/docs/api/device.yaml
+@@ -12,7 +12,7 @@
+       pairing code via `POST /api/device/token`.
+ 
+     Credit units are whole IDR. Billing is Rp 10.000 per hour of accepted
+-    audio, metered server-side. Money paths are idempotent: replays,
++    audio, reconciled against provider usage records for direct sessions. Money paths are idempotent: replays,
+     reconnects, and retries must not double-charge.
+   contact:
+     url: https://github.com/nggalek-co/titen-web
+@@ -130,9 +130,12 @@
+       summary: Authorize a transcription session
+       description: |
+         Checks device eligibility and available credit, creates the meeting,
+-        session, and a minimum reservation (one hour of credit) in one
+-        atomic step, then returns the WS URL to stream to.
+-        Returns 402-style errors via `error` field when credit is short.
++        session, and a reservation covering available credit up to five hours.
++        The ledger reservation is atomic. Returns a single-use Soniox key
++        that can start one stream within 60 seconds. Its duration limit is
++        fixed at authorization and cannot be extended by heartbeat.
++        Requires at least ten minutes of available credit. No provider key
++        means 503. There is no automatic development proxy fallback.
+       security: [deviceToken: []]
+       requestBody:
+         content:
+@@ -150,7 +153,18 @@
+             application/json:
+               schema:
+                 type: object
+-                required: [sessionId, meetingId, reservationId, wsUrl, rateUnitsPerHour]
++                required:
++                  [
++                    sessionId,
++                    meetingId,
++                    reservationId,
++                    wsUrl,
++                    rateUnitsPerHour,
++                    temporaryApiKey,
++                    expiresAt,
++                    maxSessionDurationSeconds,
++                    model,
++                  ]
+                 properties:
+                   sessionId: { type: string, format: uuid }
+                   meetingId: { type: string, format: uuid }
+@@ -159,8 +173,16 @@
+                     {
+                       type: string,
+                       format: uri,
+-                      example: 'wss://titen.app/api/stream?session=<id>',
++                      example: 'wss://stt-rt.soniox.com/transcribe-websocket',
+                     }
++                  temporaryApiKey:
++                    {
++                      type: string,
++                      description: 'Memory-only provider credential. Never persist or log.',
++                    }
++                  expiresAt: { type: string, format: date-time }
++                  maxSessionDurationSeconds: { type: integer, minimum: 1, maximum: 18000 }
++                  model: { type: string, enum: [stt-rt-v5] }
+                   rateUnitsPerHour: { type: integer, example: 10000 }
+         '401': { $ref: '#/components/responses/Error' }
+         '404': { $ref: '#/components/responses/Error' }
+@@ -168,12 +190,12 @@
+   /api/transcription-sessions/{sessionId}/end:
+     post:
+       tags: [transcription]
+-      summary: End a session without a stream
+-      description: |
+-        Settles the reservation and closes the meeting for a session that
+-        was authorized but never connected (or already terminal, where it
+-        is a no-op). Ending an active stream still goes over the WebSocket —
+-        this returns 409 for `active` and `reconnecting` states.
++      summary: End a direct session and retain its pending usage hold
++      description: |
++        For direct Soniox sessions, marks the session finalizing. This client
++        request cannot establish billable usage or release its reservation.
++        The internal reconciliation job settles provider-confirmed usage.
++        Legacy proxy sessions retain their existing cleanup behavior.
+       security: [deviceToken: []]
+       parameters:
+         - name: sessionId
+@@ -182,7 +204,7 @@
+           schema: { type: string, format: uuid }
+       responses:
+         '200':
+-          description: Session finalized
++          description: End accepted. Direct sessions may still await settlement.
+           content:
+             application/json:
+               schema:
+@@ -190,6 +212,7 @@
+                 required: [ended]
+                 properties:
+                   ended: { type: boolean, enum: [true] }
++                  pendingSettlement: { type: boolean }
+         '401': { $ref: '#/components/responses/Error' }
+         '404': { $ref: '#/components/responses/Error' }
+         '409':
+@@ -201,8 +224,10 @@
+   /api/stream:
+     get:
+       tags: [transcription]
+-      summary: WebSocket audio stream
+-      description: |
++      summary: Legacy proxy WebSocket audio stream
++      description: |
++        Legacy sessions only. Direct Soniox sessions receive 409 and must
++        connect to the Soniox URL returned by authorization.
+         Upgrade request. Query param `session` carries the session id.
+         Ownership is enforced: the session must belong to this device.
+ 
+@@ -236,11 +261,13 @@
+       tags: [transcription]
+       summary: Report a running stream
+       description: |
+-        Call every few seconds while streaming. The backend ensures the
+-        reservation covers accepted audio plus a 30s window; if the account
+-        can no longer extend, the session is finalized server-side and
+-        `ok:false` tells the app to stop. `minutesLeft` accounts for ALL
+-        reservations on the account, so concurrent sessions shrink it.
++        Reports liveness and optionally uploads up to 100 finalized segments.
++        Segment sequence numbers are stable per session. Replayed uploads
++        do not create duplicate transcript rows or Google document jobs.
++        Direct sessions use provider usage records for billing. Heartbeats
++        cannot extend a key, establish usage, or release a credit hold.
++        Remaining time includes this session's reserved grant and available
++        account credit. An expired or closed grant returns ok:false.
+       security: [deviceToken: []]
+       requestBody:
+         required: true
+@@ -251,6 +278,18 @@
+               required: [sessionId]
+               properties:
+                 sessionId: { type: string, format: uuid }
++                segments:
++                  type: array
++                  maxItems: 100
++                  items:
++                    type: object
++                    required: [seq, text]
++                    properties:
++                      seq: { type: integer, minimum: 1 }
++                      text: { type: string, minLength: 1, maxLength: 20000 }
++                      speaker: { type: string, maxLength: 100 }
++                      startMs: { type: integer, minimum: 0 }
++                      endMs: { type: integer, minimum: 0 }
+       responses:
+         '200':
+           description: Heartbeat outcome
+@@ -271,7 +310,7 @@
+                       ok: { type: boolean, enum: [false] }
+                       reason:
+                         type: string
+-                        enum: [session_closed, insufficient_funds]
++                        enum: [session_closed, insufficient_funds, grant_expired]
+                       secondsLeft: { type: integer }
+                       minutesLeft: { type: integer }
+         '400': { $ref: '#/components/responses/Error' }
+diff --git a/docs/decisions/002-implementation-trail.md b/docs/decisions/002-implementation-trail.md
+--- a/docs/decisions/002-implementation-trail.md
++++ b/docs/decisions/002-implementation-trail.md
+@@ -101,3 +101,44 @@
+   calling Workers `fetch` with `Upgrade: websocket`. Workers fetch rejects
+   WebSocket URL schemes before sending the handshake. Keep Bearer auth
+   and the server-owned proxy; live provider transcription remains unproven.
++
++## Direct Soniox temporary-key sessions
++
++Desktop audio connects directly to Soniox. Titen authenticates the device,
++reserves its available credit up to five hours, and issues a single-use key.
++The key can start one stream within 60 seconds. Soniox enforces a fixed stream
++duration. Heartbeats cannot extend that duration. Reconnecting requires a new
++session and a new reservation.
++
++The temporary credential stays in desktop memory. The backend stores the
++provider, key expiry, and duration limit, but never the key. Finalized transcript
++segments are uploaded through authenticated heartbeat requests with stable
++sequence numbers. Existing persistence also creates Google document jobs.
++
++Client completion only marks the session finalizing. Billing uses Soniox usage
++records matched to the session reference that the backend bound to the key.
++An empty response is not proof of zero usage. Only successfully completed
++requests appear in provider logs. Unused, failed, or delayed sessions keep their
++holds until a provider record arrives or an operator investigates them.
++Definitive mint rejection releases the hold. An ambiguous timeout retains it.
++
++The stream duration cap is a wall-clock limit. It is not a guarantee that
++uploaded audio duration, model selection, or provider cost cannot exceed the
++reservation. The ledger clamps settlement to held credit. Provider spend can
++differ from Titen's accepted-audio billing, including during capture pauses.
++
++Apply the new D1 migration before enabling the desktop change. Configure
++SONIOX_API_KEY with temporary-key, transcription, and usage-log access. Configure
++TRANSCRIPTION_RECONCILE_TOKEN with a service secret. Arrange an external periodic
++POST to /api/internal/transcription-usage with that Bearer token. Account-scoped
++reconciliation also runs when fetching budget, authorizing, and ending a session.
++No scheduler
++is installed automatically. Run this endpoint after sessions end and for clients
++that crash. It rotates through up to 100 pending sessions per call, checking the least
++recently checked sessions first. Missing records remain
++reserved and require operational review. Do not deploy without reconciliation
++and monitoring for pending holds.
++
++The former audio proxy remains available only for legacy sessions. New direct
++sessions cannot connect to it. Missing Soniox configuration fails authorization
++with 503 instead of silently falling back to synthetic transcription.
+diff --git a/drizzle/0002_direct_soniox.sql b/drizzle/0002_direct_soniox.sql
+new file mode 100644
+--- /dev/null
++++ b/drizzle/0002_direct_soniox.sql
+@@ -0,0 +1,11 @@
++ALTER TABLE transcription_sessions ADD COLUMN provider TEXT;
++--> statement-breakpoint
++ALTER TABLE transcription_sessions ADD COLUMN key_expires_at INTEGER;
++--> statement-breakpoint
++ALTER TABLE transcription_sessions ADD COLUMN max_session_duration_seconds INTEGER;
++--> statement-breakpoint
++ALTER TABLE transcription_sessions ADD COLUMN provider_usage_id TEXT;
++--> statement-breakpoint
++CREATE UNIQUE INDEX transcription_sessions_provider_usage ON transcription_sessions(provider_usage_id);
++--> statement-breakpoint
++ALTER TABLE transcription_sessions ADD COLUMN last_reconcile_check INTEGER;
+diff --git a/drizzle/meta/0002_snapshot.json b/drizzle/meta/0002_snapshot.json
+new file mode 100644
+--- /dev/null
++++ b/drizzle/meta/0002_snapshot.json
+@@ -0,0 +1,1457 @@
++{
++  "version": "6",
++  "dialect": "sqlite",
++  "id": "74cc51fb-c52c-43c3-b56e-7a9d74607e97",
++  "prevId": "dfa14124-0f9b-46bd-858e-252147c9704d",
++  "tables": {
++    "account": {
++      "name": "account",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "account_id": {
++          "name": "account_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "provider_id": {
++          "name": "provider_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "access_token": {
++          "name": "access_token",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "refresh_token": {
++          "name": "refresh_token",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "id_token": {
++          "name": "id_token",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "access_token_expires_at": {
++          "name": "access_token_expires_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "refresh_token_expires_at": {
++          "name": "refresh_token_expires_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "scope": {
++          "name": "scope",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "password": {
++          "name": "password",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "account_user_id_user_id_fk": {
++          "name": "account_user_id_user_id_fk",
++          "tableFrom": "account",
++          "tableTo": "user",
++          "columnsFrom": ["user_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "device_codes": {
++      "name": "device_codes",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "code": {
++          "name": "code",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "device_name": {
++          "name": "device_name",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "state": {
++          "name": "state",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'pending'"
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {
++        "device_codes_code_unique": {
++          "name": "device_codes_code_unique",
++          "columns": ["code"],
++          "isUnique": true
++        }
++      },
++      "foreignKeys": {
++        "device_codes_user_id_user_id_fk": {
++          "name": "device_codes_user_id_user_id_fk",
++          "tableFrom": "device_codes",
++          "tableTo": "user",
++          "columnsFrom": ["user_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "device_sessions": {
++      "name": "device_sessions",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "token_hash": {
++          "name": "token_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "name": {
++          "name": "name",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        },
++        "last_seen_at": {
++          "name": "last_seen_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "revoked_at": {
++          "name": "revoked_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        }
++      },
++      "indexes": {
++        "device_sessions_token_hash_unique": {
++          "name": "device_sessions_token_hash_unique",
++          "columns": ["token_hash"],
++          "isUnique": true
++        },
++        "device_sessions_user": {
++          "name": "device_sessions_user",
++          "columns": ["user_id"],
++          "isUnique": false
++        }
++      },
++      "foreignKeys": {
++        "device_sessions_user_id_user_id_fk": {
++          "name": "device_sessions_user_id_user_id_fk",
++          "tableFrom": "device_sessions",
++          "tableTo": "user",
++          "columnsFrom": ["user_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "doc_jobs": {
++      "name": "doc_jobs",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "account_id": {
++          "name": "account_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "meeting_id": {
++          "name": "meeting_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "kind": {
++          "name": "kind",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "payload": {
++          "name": "payload",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "status": {
++          "name": "status",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'pending'"
++        },
++        "attempts": {
++          "name": "attempts",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": 0
++        },
++        "next_retry_at": {
++          "name": "next_retry_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "idempotency_key": {
++          "name": "idempotency_key",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "last_error": {
++          "name": "last_error",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {
++        "doc_jobs_idem": {
++          "name": "doc_jobs_idem",
++          "columns": ["idempotency_key"],
++          "isUnique": true
++        },
++        "doc_jobs_meeting": {
++          "name": "doc_jobs_meeting",
++          "columns": ["meeting_id"],
++          "isUnique": false
++        }
++      },
++      "foreignKeys": {
++        "doc_jobs_account_id_user_id_fk": {
++          "name": "doc_jobs_account_id_user_id_fk",
++          "tableFrom": "doc_jobs",
++          "tableTo": "user",
++          "columnsFrom": ["account_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        },
++        "doc_jobs_meeting_id_meetings_id_fk": {
++          "name": "doc_jobs_meeting_id_meetings_id_fk",
++          "tableFrom": "doc_jobs",
++          "tableTo": "meetings",
++          "columnsFrom": ["meeting_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "google_connections": {
++      "name": "google_connections",
++      "columns": {
++        "account_id": {
++          "name": "account_id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "refresh_token_enc": {
++          "name": "refresh_token_enc",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "scope": {
++          "name": "scope",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "google_email": {
++          "name": "google_email",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "state": {
++          "name": "state",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'connected'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "google_connections_account_id_user_id_fk": {
++          "name": "google_connections_account_id_user_id_fk",
++          "tableFrom": "google_connections",
++          "tableTo": "user",
++          "columnsFrom": ["account_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "ledger_entries": {
++      "name": "ledger_entries",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "account_id": {
++          "name": "account_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "kind": {
++          "name": "kind",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "available_delta": {
++          "name": "available_delta",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "reserved_delta": {
++          "name": "reserved_delta",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "idempotency_key": {
++          "name": "idempotency_key",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "payment_order_id": {
++          "name": "payment_order_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "reservation_id": {
++          "name": "reservation_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "session_id": {
++          "name": "session_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "note": {
++          "name": "note",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {
++        "ledger_idempotency_key": {
++          "name": "ledger_idempotency_key",
++          "columns": ["idempotency_key"],
++          "isUnique": true
++        },
++        "ledger_account": {
++          "name": "ledger_account",
++          "columns": ["account_id"],
++          "isUnique": false
++        }
++      },
++      "foreignKeys": {
++        "ledger_entries_account_id_user_id_fk": {
++          "name": "ledger_entries_account_id_user_id_fk",
++          "tableFrom": "ledger_entries",
++          "tableTo": "user",
++          "columnsFrom": ["account_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "meetings": {
++      "name": "meetings",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "account_id": {
++          "name": "account_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "title": {
++          "name": "title",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "state": {
++          "name": "state",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'recording'"
++        },
++        "started_at": {
++          "name": "started_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        },
++        "ended_at": {
++          "name": "ended_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "google_doc_id": {
++          "name": "google_doc_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "google_doc_url": {
++          "name": "google_doc_url",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        }
++      },
++      "indexes": {
++        "meetings_account": {
++          "name": "meetings_account",
++          "columns": ["account_id"],
++          "isUnique": false
++        }
++      },
++      "foreignKeys": {
++        "meetings_account_id_user_id_fk": {
++          "name": "meetings_account_id_user_id_fk",
++          "tableFrom": "meetings",
++          "tableTo": "user",
++          "columnsFrom": ["account_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "payment_events": {
++      "name": "payment_events",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "provider": {
++          "name": "provider",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "provider_event_id": {
++          "name": "provider_event_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "order_id": {
++          "name": "order_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "kind": {
++          "name": "kind",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "applied": {
++          "name": "applied",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {
++        "payment_events_unique": {
++          "name": "payment_events_unique",
++          "columns": ["provider", "provider_event_id"],
++          "isUnique": true
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "payment_orders": {
++      "name": "payment_orders",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "account_id": {
++          "name": "account_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "provider": {
++          "name": "provider",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "provider_order_id": {
++          "name": "provider_order_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "amount_units": {
++          "name": "amount_units",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "currency": {
++          "name": "currency",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "credit_units": {
++          "name": "credit_units",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "status": {
++          "name": "status",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'pending'"
++        },
++        "checkout_url": {
++          "name": "checkout_url",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {
++        "payment_orders_provider_order": {
++          "name": "payment_orders_provider_order",
++          "columns": ["provider", "provider_order_id"],
++          "isUnique": true
++        }
++      },
++      "foreignKeys": {
++        "payment_orders_account_id_user_id_fk": {
++          "name": "payment_orders_account_id_user_id_fk",
++          "tableFrom": "payment_orders",
++          "tableTo": "user",
++          "columnsFrom": ["account_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "reservations": {
++      "name": "reservations",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "account_id": {
++          "name": "account_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "session_id": {
++          "name": "session_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "state": {
++          "name": "state",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'active'"
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {
++        "reservations_account": {
++          "name": "reservations_account",
++          "columns": ["account_id"],
++          "isUnique": false
++        }
++      },
++      "foreignKeys": {
++        "reservations_account_id_user_id_fk": {
++          "name": "reservations_account_id_user_id_fk",
++          "tableFrom": "reservations",
++          "tableTo": "user",
++          "columnsFrom": ["account_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "session": {
++      "name": "session",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "token": {
++          "name": "token",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "ip_address": {
++          "name": "ip_address",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "user_agent": {
++          "name": "user_agent",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {
++        "session_token_unique": {
++          "name": "session_token_unique",
++          "columns": ["token"],
++          "isUnique": true
++        }
++      },
++      "foreignKeys": {
++        "session_user_id_user_id_fk": {
++          "name": "session_user_id_user_id_fk",
++          "tableFrom": "session",
++          "tableTo": "user",
++          "columnsFrom": ["user_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "transcript_segments": {
++      "name": "transcript_segments",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "meeting_id": {
++          "name": "meeting_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "seq": {
++          "name": "seq",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "speaker": {
++          "name": "speaker",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "text": {
++          "name": "text",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "start_ms": {
++          "name": "start_ms",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "end_ms": {
++          "name": "end_ms",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {
++        "segments_meeting_seq": {
++          "name": "segments_meeting_seq",
++          "columns": ["meeting_id", "seq"],
++          "isUnique": true
++        },
++        "segments_meeting": {
++          "name": "segments_meeting",
++          "columns": ["meeting_id"],
++          "isUnique": false
++        }
++      },
++      "foreignKeys": {
++        "transcript_segments_meeting_id_meetings_id_fk": {
++          "name": "transcript_segments_meeting_id_meetings_id_fk",
++          "tableFrom": "transcript_segments",
++          "tableTo": "meetings",
++          "columnsFrom": ["meeting_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "transcription_sessions": {
++      "name": "transcription_sessions",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "account_id": {
++          "name": "account_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "device_session_id": {
++          "name": "device_session_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "meeting_id": {
++          "name": "meeting_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "reservation_id": {
++          "name": "reservation_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "state": {
++          "name": "state",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "'authorizing'"
++        },
++        "rate_units_per_hour": {
++          "name": "rate_units_per_hour",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "accepted_audio_ms": {
++          "name": "accepted_audio_ms",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": 0
++        },
++        "last_seq": {
++          "name": "last_seq",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": 0
++        },
++        "last_heartbeat_at": {
++          "name": "last_heartbeat_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "client_tag": {
++          "name": "client_tag",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        },
++        "closed_at": {
++          "name": "closed_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "provider": {
++          "name": "provider",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "key_expires_at": {
++          "name": "key_expires_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "max_session_duration_seconds": {
++          "name": "max_session_duration_seconds",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "provider_usage_id": {
++          "name": "provider_usage_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "last_reconcile_check": {
++          "name": "last_reconcile_check",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        }
++      },
++      "indexes": {
++        "tsessions_account": {
++          "name": "tsessions_account",
++          "columns": ["account_id"],
++          "isUnique": false
++        },
++        "tsessions_meeting": {
++          "name": "tsessions_meeting",
++          "columns": ["meeting_id"],
++          "isUnique": false
++        },
++        "transcription_sessions_provider_usage": {
++          "name": "transcription_sessions_provider_usage",
++          "columns": ["provider_usage_id"],
++          "isUnique": true
++        }
++      },
++      "foreignKeys": {
++        "transcription_sessions_account_id_user_id_fk": {
++          "name": "transcription_sessions_account_id_user_id_fk",
++          "tableFrom": "transcription_sessions",
++          "tableTo": "user",
++          "columnsFrom": ["account_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        },
++        "transcription_sessions_meeting_id_meetings_id_fk": {
++          "name": "transcription_sessions_meeting_id_meetings_id_fk",
++          "tableFrom": "transcription_sessions",
++          "tableTo": "meetings",
++          "columnsFrom": ["meeting_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        },
++        "transcription_sessions_reservation_id_reservations_id_fk": {
++          "name": "transcription_sessions_reservation_id_reservations_id_fk",
++          "tableFrom": "transcription_sessions",
++          "tableTo": "reservations",
++          "columnsFrom": ["reservation_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "usage_intervals": {
++      "name": "usage_intervals",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "session_id": {
++          "name": "session_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "seq": {
++          "name": "seq",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "audio_ms": {
++          "name": "audio_ms",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false,
++          "default": "(unixepoch())"
++        }
++      },
++      "indexes": {
++        "usage_intervals_seq": {
++          "name": "usage_intervals_seq",
++          "columns": ["session_id", "seq"],
++          "isUnique": true
++        }
++      },
++      "foreignKeys": {
++        "usage_intervals_session_id_transcription_sessions_id_fk": {
++          "name": "usage_intervals_session_id_transcription_sessions_id_fk",
++          "tableFrom": "usage_intervals",
++          "tableTo": "transcription_sessions",
++          "columnsFrom": ["session_id"],
++          "columnsTo": ["id"],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "user": {
++      "name": "user",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "name": {
++          "name": "name",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "email": {
++          "name": "email",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "email_verified": {
++          "name": "email_verified",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "image": {
++          "name": "image",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        }
++      },
++      "indexes": {
++        "user_email_unique": {
++          "name": "user_email_unique",
++          "columns": ["email"],
++          "isUnique": true
++        }
++      },
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    },
++    "verification": {
++      "name": "verification",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "identifier": {
++          "name": "identifier",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "value": {
++          "name": "value",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true,
++          "autoincrement": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "autoincrement": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "checkConstraints": {}
++    }
++  },
++  "views": {},
++  "enums": {},
++  "_meta": {
++    "schemas": {},
++    "tables": {},
++    "columns": {}
++  },
++  "internal": {
++    "indexes": {}
++  }
++}
+diff --git a/drizzle/meta/_journal.json b/drizzle/meta/_journal.json
+--- a/drizzle/meta/_journal.json
++++ b/drizzle/meta/_journal.json
+@@ -15,6 +15,13 @@
+       "when": 1792552881654,
+       "tag": "0001_colossal_kabuki",
+       "breakpoints": true
++    },
++    {
++      "idx": 2,
++      "version": "6",
++      "when": 1792557418503,
++      "tag": "0002_direct_soniox",
++      "breakpoints": true
+     }
+   ]
+ }
+diff --git a/src/db/schema.ts b/src/db/schema.ts
+--- a/src/db/schema.ts
++++ b/src/db/schema.ts
+@@ -213,6 +213,11 @@
+       .references(() => reservations.id),
+     state: text().$type<SessionState>().notNull().default('authorizing'),
+     rateUnitsPerHour: integer('rate_units_per_hour').notNull(),
++    provider: text().$type<'soniox'>(),
++    keyExpiresAt: integer('key_expires_at', { mode: 'timestamp' }),
++    maxSessionDurationSeconds: integer('max_session_duration_seconds'),
++    providerUsageId: text('provider_usage_id'),
++    lastReconcileCheck: integer('last_reconcile_check'),
+     acceptedAudioMs: integer('accepted_audio_ms').notNull().default(0),
+     lastSeq: integer('last_seq').notNull().default(0),
+     lastHeartbeatAt: integer('last_heartbeat_at', { mode: 'timestamp' }),
+@@ -222,7 +227,11 @@
+       .default(sql`(unixepoch())`),
+     closedAt: integer('closed_at', { mode: 'timestamp' }),
+   },
+-  (t) => [index('tsessions_account').on(t.accountId), index('tsessions_meeting').on(t.meetingId)],
++  (t) => [
++    index('tsessions_account').on(t.accountId),
++    index('tsessions_meeting').on(t.meetingId),
++    uniqueIndex('transcription_sessions_provider_usage').on(t.providerUsageId),
++  ],
+ )
+ 
+ // Server-observed accepted audio intervals; unique per (session, seq) so
+diff --git a/src/lib/transcription/direct.ts b/src/lib/transcription/direct.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/transcription/direct.ts
+@@ -0,0 +1,233 @@
++import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm'
++import { z } from 'zod'
++
++import type { Database } from '#/db'
++import { transcriptionSessions } from '#/db/schema'
++import { HttpError } from '#/lib/errors'
++import { getBalance, release } from '#/lib/ledger'
++import { TRANSCRIPTION_RATE_UNITS_PER_HOUR } from '#/lib/payments/pricing'
++import { authorizeSession, chargeUnitsForAudioMs, finalizeSession } from './service'
++
++export const SONIOX_WS_URL = 'wss://stt-rt.soniox.com/transcribe-websocket'
++const MAX_DURATION_SECONDS = 18_000
++const KEY_TTL_SECONDS = 60
++const credential = z.object({ api_key: z.string().min(1), expires_at: z.iso.datetime() })
++const usagePage = z.object({
++  usage_logs: z.array(
++    z.object({
++      uuid: z.string().min(1),
++      client_reference_id: z.string().nullable().optional(),
++      input_audio_duration_ms: z.number().int().nonnegative(),
++      model: z.string(),
++      end_time: z.iso.datetime(),
++    }),
++  ),
++  next_page_cursor: z.string().nullable().optional(),
++})
++export const uploadedSegment = z
++  .object({
++    seq: z.number().int().positive(),
++    text: z.string().min(1).max(20_000),
++    speaker: z.string().max(100).optional(),
++    startMs: z.number().int().nonnegative().optional(),
++    endMs: z.number().int().nonnegative().optional(),
++  })
++  .refine(
++    (s) => s.startMs === undefined || s.endMs === undefined || s.endMs >= s.startMs,
++    'endMs must not precede startMs',
++  )
++
++export async function authorizeDirectSession(
++  db: Database,
++  input: { accountId: string; deviceSessionId: string; clientTag?: string },
++  apiKey: string | undefined,
++  fetcher: typeof fetch = fetch,
++) {
++  if (!apiKey?.trim()) throw new HttpError(503, 'transcription provider is not configured')
++  await reconcileDirectSessions(db, apiKey, fetcher, { accountId: input.accountId })
++  const balance = await getBalance(db, input.accountId)
++  const seconds = Math.min(
++    MAX_DURATION_SECONDS,
++    Math.floor((balance.available * 3600) / TRANSCRIPTION_RATE_UNITS_PER_HOUR),
++  )
++  if (seconds < 600) throw new HttpError(402, 'insufficient credit: need ten minutes minimum')
++  const session = await authorizeSession(db, {
++    ...input,
++    reservationUnits: chargeUnitsForAudioMs(seconds * 1000, TRANSCRIPTION_RATE_UNITS_PER_HOUR),
++  })
++  // Persist liability before minting. A timeout can hide a successfully issued key.
++  await db
++    .update(transcriptionSessions)
++    .set({
++      provider: 'soniox',
++      keyExpiresAt: new Date(Date.now() + KEY_TTL_SECONDS * 1000),
++      maxSessionDurationSeconds: seconds,
++    })
++    .where(eq(transcriptionSessions.id, session.sessionId))
++  let response: Response
++  try {
++    response = await fetcher('https://api.soniox.com/v1/auth/temporary-api-key', {
++      method: 'POST',
++      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
++      body: JSON.stringify({
++        usage_type: 'transcribe_websocket',
++        expires_in_seconds: KEY_TTL_SECONDS,
++        single_use: true,
++        max_session_duration_seconds: seconds,
++        client_reference_id: session.sessionId,
++      }),
++      signal: AbortSignal.timeout(15_000),
++    })
++  } catch {
++    throw new HttpError(503, 'temporary key unavailable; reserved credit awaits reconciliation')
++  }
++  if (!response.ok) {
++    if ([400, 401, 403, 429].includes(response.status)) {
++      await release(db, {
++        reservationId: session.reservationId,
++        accountId: input.accountId,
++        idempotencyKey: `session:${session.sessionId}:release`,
++      })
++      await db
++        .update(transcriptionSessions)
++        .set({ state: 'failed' })
++        .where(
++          and(
++            eq(transcriptionSessions.id, session.sessionId),
++            eq(transcriptionSessions.state, 'authorizing'),
++          ),
++        )
++    }
++    throw new HttpError(503, 'temporary key rejected by provider')
++  }
++  const parsed = credential.safeParse(await response.json().catch(() => null))
++  if (!parsed.success) throw new HttpError(503, 'invalid temporary credential response')
++  const expiresAt = new Date(parsed.data.expires_at)
++  if (expiresAt.getTime() <= Date.now() || expiresAt.getTime() > Date.now() + 120_000)
++    throw new HttpError(503, 'invalid temporary credential expiry')
++  await db
++    .update(transcriptionSessions)
++    .set({ state: 'active', keyExpiresAt: expiresAt })
++    .where(
++      and(
++        eq(transcriptionSessions.id, session.sessionId),
++        eq(transcriptionSessions.state, 'authorizing'),
++      ),
++    )
++  return {
++    ...session,
++    wsUrl: SONIOX_WS_URL,
++    temporaryApiKey: parsed.data.api_key,
++    expiresAt: expiresAt.toISOString(),
++    maxSessionDurationSeconds: seconds,
++    model: 'stt-rt-v5',
++  }
++}
++
++export async function endDirectSession(db: Database, sessionId: string) {
++  await db
++    .update(transcriptionSessions)
++    .set({ state: 'finalizing' })
++    .where(
++      and(
++        eq(transcriptionSessions.id, sessionId),
++        eq(transcriptionSessions.provider, 'soniox'),
++        inArray(transcriptionSessions.state, ['authorizing', 'active', 'reconnecting']),
++      ),
++    )
++}
++
++export async function reconcileDirectSessions(
++  db: Database,
++  apiKey: string | undefined,
++  fetcher: typeof fetch = fetch,
++  scope: { accountId?: string; sessionId?: string } = {},
++) {
++  if (!apiKey?.trim()) throw new HttpError(503, 'transcription provider is not configured')
++  const sessions = await db
++    .select()
++    .from(transcriptionSessions)
++    .where(
++      and(
++        eq(transcriptionSessions.provider, 'soniox'),
++        scope.accountId ? eq(transcriptionSessions.accountId, scope.accountId) : undefined,
++        scope.sessionId ? eq(transcriptionSessions.id, scope.sessionId) : undefined,
++        inArray(transcriptionSessions.state, ['authorizing', 'active', 'finalizing']),
++      ),
++    )
++    .orderBy(asc(transcriptionSessions.lastReconcileCheck), asc(transcriptionSessions.id))
++    .limit(100)
++  let reconciled = 0
++  const pending = new Map(sessions.map((session) => [session.id, session]))
++  for (const session of sessions) {
++    await db
++      .update(transcriptionSessions)
++      .set({
++        lastReconcileCheck: sql`(SELECT coalesce(max(last_reconcile_check), 0) + 1 FROM transcription_sessions)`,
++      })
++      .where(eq(transcriptionSessions.id, session.id))
++    if (session.providerUsageId) {
++      await finalizeSession(db, session.id)
++      reconciled++
++      pending.delete(session.id)
++    }
++  }
++  const endTime = new Date()
++  const startTime = new Date(
++    Math.max(
++      Math.min(...sessions.map((session) => session.createdAt.getTime())) - 1000,
++      endTime.getTime() - 31 * 86400_000,
++    ),
++  )
++  let cursor: string | undefined
++  const seen = new Set<string>()
++  for (let page = 0; page < 100 && pending.size > 0; page++) {
++    const url = new URL('https://api.soniox.com/v1/usage-logs')
++    url.searchParams.set('start_time', startTime.toISOString())
++    url.searchParams.set('end_time', endTime.toISOString())
++    url.searchParams.set('limit', '1000')
++    if (cursor) url.searchParams.set('cursor', cursor)
++    const response = await fetcher(url, {
++      headers: { Authorization: `Bearer ${apiKey}` },
++      signal: AbortSignal.timeout(15_000),
++    })
++    if (!response.ok)
++      throw new HttpError(503, 'provider usage unavailable; credit remains reserved')
++    const parsed = usagePage.safeParse(await response.json().catch(() => null))
++    if (!parsed.success) throw new HttpError(503, 'invalid provider usage response')
++    for (const entry of parsed.data.usage_logs) {
++      const session = entry.client_reference_id ? pending.get(entry.client_reference_id) : undefined
++      if (
++        !session ||
++        !entry.model.startsWith('stt-') ||
++        new Date(entry.end_time).getTime() < session.createdAt.getTime()
++      )
++        continue
++      await db
++        .update(transcriptionSessions)
++        .set({
++          providerUsageId: entry.uuid,
++          acceptedAudioMs: entry.input_audio_duration_ms,
++          state: 'finalizing',
++        })
++        .where(
++          and(
++            eq(transcriptionSessions.id, session.id),
++            isNull(transcriptionSessions.providerUsageId),
++            inArray(transcriptionSessions.state, ['authorizing', 'active', 'finalizing']),
++          ),
++        )
++      await finalizeSession(db, session.id)
++      reconciled++
++      pending.delete(session.id)
++    }
++    const next = parsed.data.next_page_cursor
++    if (!next) break
++    if (seen.has(next)) throw new HttpError(503, 'provider usage pagination repeated')
++    if (page === 99 && pending.size > 0)
++      throw new HttpError(503, 'provider usage pagination limit reached; credit remains reserved')
++    seen.add(next)
++    cursor = next
++  }
++  return { checked: sessions.length, reconciled, pending: sessions.length - reconciled }
++}
+diff --git a/src/lib/transcription/service.ts b/src/lib/transcription/service.ts
+--- a/src/lib/transcription/service.ts
++++ b/src/lib/transcription/service.ts
+@@ -27,7 +27,12 @@
+ 
+ export async function authorizeSession(
+   db: Database,
+-  input: { accountId: string; deviceSessionId?: string; clientTag?: string },
++  input: {
++    accountId: string
++    deviceSessionId?: string
++    clientTag?: string
++    reservationUnits?: number
++  },
+ ): Promise<{ sessionId: string; meetingId: string; reservationId: string }> {
+   const balance = await getBalance(db, input.accountId)
+   if (balance.available < MIN_RESERVATION_UNITS) {
+@@ -39,7 +44,7 @@
+ 
+   const r = await reserve(db, {
+     accountId: input.accountId,
+-    units: MIN_RESERVATION_UNITS,
++    units: input.reservationUnits ?? MIN_RESERVATION_UNITS,
+     sessionId,
+     idempotencyKey: `session:${sessionId}:reserve`,
+   })
+@@ -131,6 +136,19 @@
+     )
+     .limit(1)
+   if (!s) return { ok: false, reason: 'session_closed' }
++  if (s.provider === 'soniox') {
++    await db
++      .update(transcriptionSessions)
++      .set({ lastHeartbeatAt: new Date() })
++      .where(
++        and(eq(transcriptionSessions.id, sessionId), eq(transcriptionSessions.state, 'active')),
++      )
++    const latestEnd =
++      (s.keyExpiresAt?.getTime() ?? s.createdAt.getTime()) +
++      (s.maxSessionDurationSeconds ?? 0) * 1000
++    if (Date.now() >= latestEnd) return { ok: false, reason: 'grant_expired' }
++    return { ok: true, heldUnits: await heldUnits(db, s.reservationId) }
++  }
+   const held = await heldUnits(db, s.reservationId)
+   const projected = chargeUnitsForAudioMs(
+     s.acceptedAudioMs + HEARTBEAT_COVER_MS,
+@@ -226,6 +244,7 @@
+     .where(eq(transcriptionSessions.id, sessionId))
+     .limit(1)
+   if (!s || s.state === 'closed' || s.state === 'failed') return
++  if (s.provider === 'soniox' && !s.providerUsageId) return
+ 
+   const billed = chargeUnitsForAudioMs(s.acceptedAudioMs, s.rateUnitsPerHour)
+   await settle(db, {
+diff --git a/src/routeTree.gen.ts b/src/routeTree.gen.ts
+--- a/src/routeTree.gen.ts
++++ b/src/routeTree.gen.ts
+@@ -30,6 +30,7 @@
+ import { Route as ApiGoogleConnectRouteImport } from './routes/api/google/connect'
+ import { Route as ApiGoogleDisconnectRouteImport } from './routes/api/google/disconnect'
+ import { Route as ApiInternalDocJobsRouteImport } from './routes/api/internal/doc-jobs'
++import { Route as ApiInternalTranscriptionUsageRouteImport } from './routes/api/internal/transcription-usage'
+ import { Route as ApiMeBalanceRouteImport } from './routes/api/me/balance'
+ import { Route as ApiMeDevicesRouteImport } from './routes/api/me/devices'
+ import { Route as ApiMeGoogleRouteImport } from './routes/api/me/google'
+@@ -151,6 +152,12 @@
+   path: '/api/internal/doc-jobs',
+   getParentRoute: () => rootRouteImport,
+ } as any)
++const ApiInternalTranscriptionUsageRoute =
++  ApiInternalTranscriptionUsageRouteImport.update({
++    id: '/api/internal/transcription-usage',
++    path: '/api/internal/transcription-usage',
++    getParentRoute: () => rootRouteImport,
++  } as any)
+ const ApiMeBalanceRoute = ApiMeBalanceRouteImport.update({
+   id: '/api/me/balance',
+   path: '/api/me/balance',
+@@ -246,6 +253,7 @@
+   '/api/google/connect': typeof ApiGoogleConnectRoute
+   '/api/google/disconnect': typeof ApiGoogleDisconnectRoute
+   '/api/internal/doc-jobs': typeof ApiInternalDocJobsRoute
++  '/api/internal/transcription-usage': typeof ApiInternalTranscriptionUsageRoute
+   '/api/me/balance': typeof ApiMeBalanceRoute
+   '/api/me/devices': typeof ApiMeDevicesRouteWithChildren
+   '/api/me/google': typeof ApiMeGoogleRoute
+@@ -283,6 +291,7 @@
+   '/api/google/connect': typeof ApiGoogleConnectRoute
+   '/api/google/disconnect': typeof ApiGoogleDisconnectRoute
+   '/api/internal/doc-jobs': typeof ApiInternalDocJobsRoute
++  '/api/internal/transcription-usage': typeof ApiInternalTranscriptionUsageRoute
+   '/api/me/balance': typeof ApiMeBalanceRoute
+   '/api/me/devices': typeof ApiMeDevicesRouteWithChildren
+   '/api/me/google': typeof ApiMeGoogleRoute
+@@ -321,6 +330,7 @@
+   '/api/google/connect': typeof ApiGoogleConnectRoute
+   '/api/google/disconnect': typeof ApiGoogleDisconnectRoute
+   '/api/internal/doc-jobs': typeof ApiInternalDocJobsRoute
++  '/api/internal/transcription-usage': typeof ApiInternalTranscriptionUsageRoute
+   '/api/me/balance': typeof ApiMeBalanceRoute
+   '/api/me/devices': typeof ApiMeDevicesRouteWithChildren
+   '/api/me/google': typeof ApiMeGoogleRoute
+@@ -360,6 +370,7 @@
+     | '/api/google/connect'
+     | '/api/google/disconnect'
+     | '/api/internal/doc-jobs'
++    | '/api/internal/transcription-usage'
+     | '/api/me/balance'
+     | '/api/me/devices'
+     | '/api/me/google'
+@@ -397,6 +408,7 @@
+     | '/api/google/connect'
+     | '/api/google/disconnect'
+     | '/api/internal/doc-jobs'
++    | '/api/internal/transcription-usage'
+     | '/api/me/balance'
+     | '/api/me/devices'
+     | '/api/me/google'
+@@ -434,6 +446,7 @@
+     | '/api/google/connect'
+     | '/api/google/disconnect'
+     | '/api/internal/doc-jobs'
++    | '/api/internal/transcription-usage'
+     | '/api/me/balance'
+     | '/api/me/devices'
+     | '/api/me/google'
+@@ -472,6 +485,7 @@
+   ApiGoogleConnectRoute: typeof ApiGoogleConnectRoute
+   ApiGoogleDisconnectRoute: typeof ApiGoogleDisconnectRoute
+   ApiInternalDocJobsRoute: typeof ApiInternalDocJobsRoute
++  ApiInternalTranscriptionUsageRoute: typeof ApiInternalTranscriptionUsageRoute
+   ApiMeBalanceRoute: typeof ApiMeBalanceRoute
+   ApiMeDevicesRoute: typeof ApiMeDevicesRouteWithChildren
+   ApiMeGoogleRoute: typeof ApiMeGoogleRoute
+@@ -632,6 +646,13 @@
+       path: '/api/internal/doc-jobs'
+       fullPath: '/api/internal/doc-jobs'
+       preLoaderRoute: typeof ApiInternalDocJobsRouteImport
++      parentRoute: typeof rootRouteImport
++    }
++    '/api/internal/transcription-usage': {
++      id: '/api/internal/transcription-usage'
++      path: '/api/internal/transcription-usage'
++      fullPath: '/api/internal/transcription-usage'
++      preLoaderRoute: typeof ApiInternalTranscriptionUsageRouteImport
+       parentRoute: typeof rootRouteImport
+     }
+     '/api/me/balance': {
+@@ -796,6 +817,7 @@
+   ApiGoogleConnectRoute: ApiGoogleConnectRoute,
+   ApiGoogleDisconnectRoute: ApiGoogleDisconnectRoute,
+   ApiInternalDocJobsRoute: ApiInternalDocJobsRoute,
++  ApiInternalTranscriptionUsageRoute: ApiInternalTranscriptionUsageRoute,
+   ApiMeBalanceRoute: ApiMeBalanceRoute,
+   ApiMeDevicesRoute: ApiMeDevicesRouteWithChildren,
+   ApiMeGoogleRoute: ApiMeGoogleRoute,
+diff --git a/src/routes/api/heartbeat.ts b/src/routes/api/heartbeat.ts
+--- a/src/routes/api/heartbeat.ts
++++ b/src/routes/api/heartbeat.ts
+@@ -1,6 +1,7 @@
+ import { createFileRoute } from '@tanstack/react-router'
++import { env } from 'cloudflare:workers'
+ 
+-import { eq } from 'drizzle-orm'
++import { and, eq } from 'drizzle-orm'
+ 
+ import { z } from 'zod'
+ 
+@@ -11,17 +12,9 @@
+ import { HttpError } from '#/lib/errors'
+ import { getBalance } from '#/lib/ledger'
+ import { TRANSCRIPTION_RATE_UNITS_PER_HOUR } from '#/lib/payments/pricing'
+-import { heartbeatSession } from '#/lib/transcription/service'
++import { heartbeatSession, persistSegment } from '#/lib/transcription/service'
++import { uploadedSegment, reconcileDirectSessions } from '#/lib/transcription/direct'
+ 
+-// POST /api/heartbeat { sessionId } — the desktop reports a running stream.
+-// Response carries ok plus the account's remaining seconds/minutes so the
+-// app can show a live quota countdown and stop when credit runs out.
+-// The backend covers the next audio window from the reservation, finalizes
+-// and returns ok:false when the account can no longer extend.
+-//
+-// GET /api/heartbeat — the device's remaining transcription budget.
+-// secondsLeft reflects ALL reservations on the account, so concurrent
+-// sessions on other devices shrink it and cannot silently over-consume.
+ export const Route = createFileRoute('/api/heartbeat')({
+   server: {
+     handlers: {
+@@ -29,23 +22,62 @@
+         try {
+           const db = getDb()
+           const device = await requireDevice(db, request)
+-          const body = await parseJson(request, z.object({ sessionId: z.string().min(1) }))
++          const body = await parseJson(
++            request,
++            z.object({
++              sessionId: z.string().min(1),
++              segments: z.array(uploadedSegment).max(100).optional(),
++            }),
++          )
+           const [s] = await db
+             .select({
+               accountId: transcriptionSessions.accountId,
+               deviceSessionId: transcriptionSessions.deviceSessionId,
++              meetingId: transcriptionSessions.meetingId,
++              provider: transcriptionSessions.provider,
++              state: transcriptionSessions.state,
++              createdAt: transcriptionSessions.createdAt,
++              maxSessionDurationSeconds: transcriptionSessions.maxSessionDurationSeconds,
+             })
+             .from(transcriptionSessions)
+-            .where(eq(transcriptionSessions.id, body.sessionId))
++            .where(
++              and(
++                eq(transcriptionSessions.id, body.sessionId),
++                eq(transcriptionSessions.accountId, device.userId),
++                eq(transcriptionSessions.deviceSessionId, device.deviceSessionId),
++              ),
++            )
+             .limit(1)
+           if (!s || s.accountId !== device.userId || s.deviceSessionId !== device.deviceSessionId) {
+             throw new HttpError(404, 'session not found')
+           }
+-          const result = await heartbeatSession(db, body.sessionId)
++          if (body.segments?.length) {
++            if (s.provider !== 'soniox' || !['active', 'finalizing', 'closed'].includes(s.state))
++              throw new HttpError(409, 'session cannot accept transcript uploads')
++            for (const segment of body.segments) {
++              await persistSegment(db, {
++                ...segment,
++                accountId: device.userId,
++                meetingId: s.meetingId,
++              })
++            }
++          }
++          const result =
++            body.segments?.length && s.provider === 'soniox'
++              ? { ok: true as const, heldUnits: 0 }
++              : await heartbeatSession(db, body.sessionId)
+           const balance = await getBalance(db, device.userId)
+-          const secondsLeft = Math.floor(
+-            (balance.available * 3600) / TRANSCRIPTION_RATE_UNITS_PER_HOUR,
+-          )
++          const grantSecondsLeft =
++            s.provider === 'soniox' && s.state === 'active'
++              ? Math.max(
++                  0,
++                  (s.maxSessionDurationSeconds ?? 0) -
++                    Math.ceil((Date.now() - s.createdAt.getTime()) / 1000),
++                )
++              : 0
++          const secondsLeft =
++            grantSecondsLeft +
++            Math.floor((balance.available * 3600) / TRANSCRIPTION_RATE_UNITS_PER_HOUR)
+           return Response.json({
+             ...result,
+             secondsLeft,
+@@ -58,6 +90,10 @@
+       GET: async ({ request }) => {
+         try {
+           const device = await requireDevice(getDb(), request)
++          if (env.SONIOX_API_KEY)
++            await reconcileDirectSessions(getDb(), env.SONIOX_API_KEY, fetch, {
++              accountId: device.userId,
++            }).catch(() => undefined)
+           const balance = await getBalance(getDb(), device.userId)
+           const secondsLeft = Math.floor(
+             (balance.available * 3600) / TRANSCRIPTION_RATE_UNITS_PER_HOUR,
+diff --git a/src/routes/api/internal/transcription-usage.ts b/src/routes/api/internal/transcription-usage.ts
+new file mode 100644
+--- /dev/null
++++ b/src/routes/api/internal/transcription-usage.ts
+@@ -0,0 +1,23 @@
++import { createFileRoute } from '@tanstack/react-router'
++import { env } from 'cloudflare:workers'
++import { getDb } from '#/db'
++import { jsonError } from '#/lib/api-auth'
++import { HttpError } from '#/lib/errors'
++import { reconcileDirectSessions } from '#/lib/transcription/direct'
++
++export const Route = createFileRoute('/api/internal/transcription-usage')({
++  server: {
++    handlers: {
++      POST: async ({ request }) => {
++        try {
++          const token = env.TRANSCRIPTION_RECONCILE_TOKEN
++          if (!token || request.headers.get('Authorization') !== `Bearer ${token}`)
++            throw new HttpError(401, 'service authorization required')
++          return Response.json(await reconcileDirectSessions(getDb(), env.SONIOX_API_KEY))
++        } catch (error) {
++          return jsonError(error)
++        }
++      },
++    },
++  },
++})
+diff --git a/src/routes/api/stream.ts b/src/routes/api/stream.ts
+--- a/src/routes/api/stream.ts
++++ b/src/routes/api/stream.ts
+@@ -55,6 +55,7 @@
+             .limit(1)
+           if (!s || s.accountId !== device.userId || s.deviceSessionId !== device.deviceSessionId)
+             throw new HttpError(404, 'session not found')
++          if (s.provider === 'soniox') throw new HttpError(409, 'connect directly to Soniox')
+           if (s.state !== 'authorizing' && s.state !== 'reconnecting') {
+             throw new HttpError(409, `session is ${s.state}`)
+           }
+diff --git a/src/routes/api/transcription-sessions.$sessionId.end.ts b/src/routes/api/transcription-sessions.$sessionId.end.ts
+--- a/src/routes/api/transcription-sessions.$sessionId.end.ts
++++ b/src/routes/api/transcription-sessions.$sessionId.end.ts
+@@ -1,5 +1,7 @@
+ import { createFileRoute } from '@tanstack/react-router'
++import { env, waitUntil } from 'cloudflare:workers'
+ import { and, eq } from 'drizzle-orm'
++import { endDirectSession, reconcileDirectSessions } from '#/lib/transcription/direct'
+ 
+ import { getDb } from '#/db'
+ import { transcriptionSessions } from '#/db/schema'
+@@ -18,7 +20,13 @@
+           const [session] = await db
+             .select()
+             .from(transcriptionSessions)
+-            .where(eq(transcriptionSessions.id, params.sessionId))
++            .where(
++              and(
++                eq(transcriptionSessions.id, params.sessionId),
++                eq(transcriptionSessions.accountId, device.userId),
++                eq(transcriptionSessions.deviceSessionId, device.deviceSessionId),
++              ),
++            )
+             .limit(1)
+           if (
+             !session ||
+@@ -26,6 +34,16 @@
+             session.deviceSessionId !== device.deviceSessionId
+           ) {
+             throw new HttpError(404, 'session not found')
++          }
++          if (session.provider === 'soniox') {
++            await endDirectSession(db, session.id)
++            waitUntil(
++              reconcileDirectSessions(db, env.SONIOX_API_KEY, fetch, {
++                accountId: device.userId,
++                sessionId: session.id,
++              }).catch(() => undefined),
++            )
++            return Response.json({ ended: true, pendingSettlement: session.state !== 'closed' })
+           }
+           if (
+             session.state !== 'authorizing' &&
+diff --git a/src/routes/api/transcription-sessions.ts b/src/routes/api/transcription-sessions.ts
+--- a/src/routes/api/transcription-sessions.ts
++++ b/src/routes/api/transcription-sessions.ts
+@@ -1,11 +1,12 @@
+ import { createFileRoute } from '@tanstack/react-router'
++import { env } from 'cloudflare:workers'
+ 
+ import { z } from 'zod'
+ 
+ import { getDb } from '#/db'
+ import { jsonError, parseJson } from '#/lib/api-auth'
+ import { requireDevice } from '#/lib/device-auth'
+-import { authorizeSession } from '#/lib/transcription/service'
++import { authorizeDirectSession } from '#/lib/transcription/direct'
+ import { TRANSCRIPTION_RATE_UNITS_PER_HOUR } from '#/lib/payments/pricing'
+ 
+ export const Route = createFileRoute('/api/transcription-sessions')({
+@@ -15,17 +16,22 @@
+         try {
+           const device = await requireDevice(getDb(), request)
+           const body = await parseJson(request, z.object({ clientTag: z.string().optional() }))
+-          const session = await authorizeSession(getDb(), {
+-            accountId: device.userId,
+-            deviceSessionId: device.deviceSessionId,
+-            clientTag: body.clientTag,
+-          })
+-          const origin = new URL(request.url).origin.replace(/^http/, 'ws')
+-          return Response.json({
+-            ...session,
+-            wsUrl: `${origin}/api/stream?session=${session.sessionId}`,
+-            rateUnitsPerHour: TRANSCRIPTION_RATE_UNITS_PER_HOUR,
+-          })
++          const session = await authorizeDirectSession(
++            getDb(),
++            {
++              accountId: device.userId,
++              deviceSessionId: device.deviceSessionId,
++              clientTag: body.clientTag,
++            },
++            env.SONIOX_API_KEY,
++          )
++          return Response.json(
++            {
++              ...session,
++              rateUnitsPerHour: TRANSCRIPTION_RATE_UNITS_PER_HOUR,
++            },
++            { headers: { 'Cache-Control': 'no-store' } },
++          )
+         } catch (err) {
+           return jsonError(err)
+         }
+diff --git a/src/worker-env.d.ts b/src/worker-env.d.ts
+--- a/src/worker-env.d.ts
++++ b/src/worker-env.d.ts
+@@ -3,6 +3,7 @@
+     DB: D1Database
+     BETTER_AUTH_SECRET?: string
+     BETTER_AUTH_URL?: string
++    TRANSCRIPTION_RECONCILE_TOKEN?: string
+     SONIOX_API_KEY?: string
+     SONIOX_WS_URL?: string
+     GOOGLE_CLIENT_ID?: string
+diff --git a/test/direct-heartbeat.test.ts b/test/direct-heartbeat.test.ts
+new file mode 100644
+--- /dev/null
++++ b/test/direct-heartbeat.test.ts
+@@ -0,0 +1,122 @@
++import { beforeEach, expect, it, vi } from 'vitest'
++vi.mock('cloudflare:workers', () => ({ env: {} }))
++import { eq } from 'drizzle-orm'
++import { z } from 'zod'
++import { transcriptSegments, transcriptionSessions, user } from '#/db/schema'
++import { creditTopup } from '#/lib/ledger'
++import { authorizeDirectSession } from '#/lib/transcription/direct'
++import { createTestDb, uniqueKey, type TestDb } from './helpers/db'
++
++const harness = vi.hoisted(() => ({
++  database: (): TestDb => {
++    throw new Error('database not initialized')
++  },
++  post: async (_input: { request: Request }): Promise<Response> => {
++    throw new Error('route not loaded')
++  },
++}))
++vi.mock('@tanstack/react-router', () => ({
++  createFileRoute: () => (options: { server: { handlers: { POST: typeof harness.post } } }) => {
++    harness.post = options.server.handlers.POST
++    return options
++  },
++}))
++vi.mock('#/db', () => ({ getDb: () => harness.database() }))
++vi.mock('#/lib/device-auth', () => ({
++  requireDevice: async () => ({ userId: 'sync-user', deviceSessionId: 'sync-device' }),
++}))
++vi.mock('#/lib/api-auth', () => ({
++  jsonError: (error: unknown) => {
++    throw error
++  },
++  parseJson: async (request: Request, schema: { parse: (body: unknown) => unknown }) =>
++    schema.parse(await request.json()),
++}))
++let db: TestDb
++let sessionId: string
++beforeEach(async () => {
++  db = createTestDb()
++  harness.database = () => db
++  await db.insert(user).values({
++    id: 'sync-user',
++    name: 'Sync',
++    email: 'sync@example.com',
++    emailVerified: true,
++    createdAt: new Date(),
++    updatedAt: new Date(),
++  })
++  await creditTopup(db, {
++    accountId: 'sync-user',
++    units: 10_000,
++    idempotencyKey: uniqueKey('sync'),
++  })
++  const fetcher = vi
++    .fn<typeof fetch>()
++    .mockResolvedValue(
++      Response.json({ api_key: 'temp', expires_at: new Date(Date.now() + 60_000).toISOString() }),
++    )
++  sessionId = (
++    await authorizeDirectSession(
++      db,
++      { accountId: 'sync-user', deviceSessionId: 'sync-device' },
++      'server-key',
++      fetcher,
++    )
++  ).sessionId
++  await import('#/routes/api/heartbeat')
++})
++function post(segments?: unknown[]) {
++  return harness.post({
++    request: new Request('http://localhost/api/heartbeat', {
++      method: 'POST',
++      body: JSON.stringify({ sessionId, segments }),
++    }),
++  })
++}
++it('counts this session grant in the displayed budget and accepts replayed transcript batches', async () => {
++  const segments = [{ seq: 1, text: 'Notes', speaker: '1', startMs: 0, endMs: 1000 }]
++  const body = z
++    .object({ ok: z.boolean(), secondsLeft: z.number() })
++    .parse(await (await post(segments)).json())
++  expect(body.ok).toBe(true)
++  expect(body.secondsLeft).toBeGreaterThan(3590)
++  await post(segments)
++  expect(await db.select().from(transcriptSegments)).toHaveLength(1)
++  const [row] = await db.select().from(transcriptionSessions)
++  expect(row.acceptedAudioMs).toBe(0)
++})
++it('another device cannot upload segments to this session', async () => {
++  await db
++    .update(transcriptionSessions)
++    .set({ deviceSessionId: 'another-device' })
++    .where(eq(transcriptionSessions.id, sessionId))
++  await expect(post([{ seq: 1, text: 'Forged' }])).rejects.toMatchObject({ status: 404 })
++  expect(await db.select().from(transcriptSegments)).toHaveLength(0)
++})
++it('rejects oversized batches before writing segments', async () => {
++  await expect(
++    post(Array.from({ length: 101 }, (_, i) => ({ seq: i + 1, text: 'text' }))),
++  ).rejects.toBeDefined()
++  expect(await db.select().from(transcriptSegments)).toHaveLength(0)
++})
++
++it('accepts final transcript sync after provider reconciliation has closed billing', async () => {
++  await db
++    .update(transcriptionSessions)
++    .set({ state: 'closed', providerUsageId: 'completed-provider-record' })
++    .where(eq(transcriptionSessions.id, sessionId))
++  const synced = await (await post([{ seq: 1, text: 'Last words' }])).json()
++  expect(synced).toMatchObject({ ok: true })
++  expect(await db.select().from(transcriptSegments)).toHaveLength(1)
++  expect(await (await post()).json()).toMatchObject({ ok: false, reason: 'session_closed' })
++})
++
++it('acknowledges final transcript uploads while billing awaits reconciliation', async () => {
++  await db
++    .update(transcriptionSessions)
++    .set({ state: 'finalizing' })
++    .where(eq(transcriptionSessions.id, sessionId))
++  expect(await (await post([{ seq: 1, text: 'Final note' }])).json()).toMatchObject({ ok: true })
++  expect(await db.select().from(transcriptSegments)).toHaveLength(1)
++  expect(await (await post()).json()).toMatchObject({ ok: false, reason: 'session_closed' })
++})
+diff --git a/test/direct.test.ts b/test/direct.test.ts
+new file mode 100644
+--- /dev/null
++++ b/test/direct.test.ts
+@@ -0,0 +1,188 @@
++import { beforeEach, expect, it, vi } from 'vitest'
++import { eq } from 'drizzle-orm'
++import { transcriptionSessions, user } from '#/db/schema'
++import { creditTopup, getBalance } from '#/lib/ledger'
++import {
++  authorizeDirectSession,
++  endDirectSession,
++  reconcileDirectSessions,
++} from '#/lib/transcription/direct'
++import { finalizeSession, persistSegment } from '#/lib/transcription/service'
++import { createTestDb, uniqueKey, type TestDb } from './helpers/db'
++
++let db: TestDb
++beforeEach(async () => {
++  db = createTestDb()
++  await db.insert(user).values({
++    id: 'direct-user',
++    name: 'Direct',
++    email: 'direct@example.com',
++    emailVerified: true,
++    createdAt: new Date(),
++    updatedAt: new Date(),
++  })
++  await creditTopup(db, {
++    accountId: 'direct-user',
++    units: 10_000,
++    idempotencyKey: uniqueKey('direct'),
++  })
++})
++const input = { accountId: 'direct-user', deviceSessionId: 'direct-device' }
++function mint() {
++  return vi
++    .fn<typeof fetch>()
++    .mockResolvedValue(
++      Response.json(
++        { api_key: 'temporary-test-key', expires_at: new Date(Date.now() + 60_000).toISOString() },
++        { status: 201 },
++      ),
++    )
++}
++async function usage(sessionId: string, audioMs = 60_000) {
++  return Response.json({
++    usage_logs: [
++      {
++        uuid: `usage-${sessionId}`,
++        client_reference_id: sessionId,
++        input_audio_duration_ms: audioMs,
++        model: 'stt-rt-v5',
++        end_time: new Date().toISOString(),
++      },
++    ],
++    next_page_cursor: null,
++  })
++}
++it('reserves the full allowance and mints one restricted provider credential', async () => {
++  const fetcher = mint()
++  const grant = await authorizeDirectSession(db, input, 'server-secret', fetcher)
++  expect(grant.maxSessionDurationSeconds).toBe(3600)
++  expect(grant.wsUrl).toBe('wss://stt-rt.soniox.com/transcribe-websocket')
++  expect(grant.temporaryApiKey).toBe('temporary-test-key')
++  expect(await getBalance(db, input.accountId)).toEqual({ available: 0, reserved: 10_000 })
++  const [url, init] = fetcher.mock.calls[0]
++  expect(url).toBe('https://api.soniox.com/v1/auth/temporary-api-key')
++  expect(JSON.parse(init!.body as string)).toEqual({
++    usage_type: 'transcribe_websocket',
++    expires_in_seconds: 60,
++    single_use: true,
++    max_session_duration_seconds: 3600,
++    client_reference_id: grant.sessionId,
++  })
++  const [row] = await db.select().from(transcriptionSessions)
++  expect(JSON.stringify(row)).not.toContain('temporary-test-key')
++})
++it('rejects missing provider configuration before reserving credit', async () => {
++  await expect(authorizeDirectSession(db, input, undefined)).rejects.toMatchObject({ status: 503 })
++  expect((await getBalance(db, input.accountId)).reserved).toBe(0)
++})
++it('keeps the hold when minting times out because issuance is uncertain', async () => {
++  const fetcher = vi.fn<typeof fetch>().mockRejectedValue(new Error('timeout'))
++  await expect(authorizeDirectSession(db, input, 'server-secret', fetcher)).rejects.toMatchObject({
++    status: 503,
++  })
++  expect((await getBalance(db, input.accountId)).reserved).toBe(10_000)
++})
++it('client end and direct calls to finalization cannot release unverified usage', async () => {
++  const grant = await authorizeDirectSession(db, input, 'server-secret', mint())
++  await endDirectSession(db, grant.sessionId)
++  await finalizeSession(db, grant.sessionId)
++  await endDirectSession(db, grant.sessionId)
++  expect((await getBalance(db, input.accountId)).reserved).toBe(10_000)
++})
++it('empty usage records retain the hold even after client end', async () => {
++  const grant = await authorizeDirectSession(db, input, 'server-secret', mint())
++  await endDirectSession(db, grant.sessionId)
++  const fetcher = vi
++    .fn<typeof fetch>()
++    .mockResolvedValue(Response.json({ usage_logs: [], next_page_cursor: null }))
++  expect(await reconcileDirectSessions(db, 'server-secret', fetcher)).toEqual({
++    checked: 1,
++    reconciled: 0,
++    pending: 1,
++  })
++  expect((await getBalance(db, input.accountId)).reserved).toBe(10_000)
++})
++it('paginates provider records and settles observed usage exactly once', async () => {
++  const grant = await authorizeDirectSession(db, input, 'server-secret', mint())
++  const fetcher = vi
++    .fn<typeof fetch>()
++    .mockResolvedValueOnce(Response.json({ usage_logs: [], next_page_cursor: 'page-2' }))
++    .mockResolvedValueOnce(await usage(grant.sessionId))
++  expect((await reconcileDirectSessions(db, 'server-secret', fetcher)).reconciled).toBe(1)
++  expect(new URL(fetcher.mock.calls[1][0] as URL).searchParams.get('cursor')).toBe('page-2')
++  expect(await getBalance(db, input.accountId)).toEqual({ available: 9833, reserved: 0 })
++  await reconcileDirectSessions(db, 'server-secret', fetcher)
++  expect(await getBalance(db, input.accountId)).toEqual({ available: 9833, reserved: 0 })
++  const [row] = await db
++    .select()
++    .from(transcriptionSessions)
++    .where(eq(transcriptionSessions.id, grant.sessionId))
++  expect(row.acceptedAudioMs).toBe(60_000)
++  expect(row.state).toBe('closed')
++})
++it('unrelated provider records cannot release a reservation', async () => {
++  await authorizeDirectSession(db, input, 'server-secret', mint())
++  const fetcher = vi.fn<typeof fetch>().mockResolvedValue(await usage('another-session'))
++  expect((await reconcileDirectSessions(db, 'server-secret', fetcher)).reconciled).toBe(0)
++  expect((await getBalance(db, input.accountId)).reserved).toBe(10_000)
++})
++it('concurrent authorizations cannot spend the same available balance', async () => {
++  const results = await Promise.allSettled([
++    authorizeDirectSession(db, input, 'server-secret', mint()),
++    authorizeDirectSession(db, input, 'server-secret', mint()),
++  ])
++  expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
++  expect(await getBalance(db, input.accountId)).toEqual({ available: 0, reserved: 10_000 })
++})
++
++it('replayed transcript uploads create one segment and one Google document job', async () => {
++  const grant = await authorizeDirectSession(db, input, 'server-secret', mint())
++  const segment = {
++    accountId: input.accountId,
++    meetingId: grant.meetingId,
++    seq: 1,
++    text: 'Meeting note',
++    speaker: '1',
++    startMs: 100,
++    endMs: 800,
++  }
++  expect(await persistSegment(db, segment)).toBe(true)
++  expect(await persistSegment(db, segment)).toBe(false)
++  const { transcriptSegments, docJobs } = await import('#/db/schema')
++  expect(await db.select().from(transcriptSegments)).toHaveLength(1)
++  expect(await db.select().from(docJobs)).toHaveLength(1)
++})
++
++it('a definitive mint rejection releases credit without issuing a usable grant', async () => {
++  const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 401 }))
++  await expect(authorizeDirectSession(db, input, 'invalid-key', fetcher)).rejects.toMatchObject({
++    status: 503,
++  })
++  expect(await getBalance(db, input.accountId)).toEqual({ available: 10_000, reserved: 0 })
++})
++
++it('rotates pending checks so missing logs cannot starve later sessions', async () => {
++  const { authorizeSession } = await import('#/lib/transcription/service')
++  const grants = []
++  await creditTopup(db, {
++    accountId: input.accountId,
++    units: 1_000_000,
++    idempotencyKey: uniqueKey('rotation'),
++  })
++  for (let i = 0; i < 101; i++) {
++    const grant = await authorizeSession(db, input)
++    await db
++      .update(transcriptionSessions)
++      .set({ provider: 'soniox', state: 'finalizing' })
++      .where(eq(transcriptionSessions.id, grant.sessionId))
++    grants.push(grant)
++  }
++  const fetcher = vi
++    .fn<typeof fetch>()
++    .mockResolvedValue(Response.json({ usage_logs: [], next_page_cursor: null }))
++  await reconcileDirectSessions(db, 'server-key', fetcher)
++  const unchecked = await db.select().from(transcriptionSessions)
++  const last = unchecked.find((session) => session.lastReconcileCheck === null)!
++  fetcher.mockResolvedValue(await usage(last.id))
++  expect((await reconcileDirectSessions(db, 'server-key', fetcher)).reconciled).toBe(1)
++})
+diff --git a/test/helpers/db.ts b/test/helpers/db.ts
+--- a/test/helpers/db.ts
++++ b/test/helpers/db.ts
+@@ -22,7 +22,12 @@
+       if (trimmed) sqlite.exec(trimmed)
+     }
+   }
+-  return drizzle(sqlite, { schema }) as unknown as TestDb
++  const database = drizzle(sqlite, { schema })
++  return Object.assign(database, {
++    batch: sqlite.transaction((queries: Array<{ run: () => unknown }>) =>
++      queries.map((query) => query.run()),
++    ),
++  }) as unknown as TestDb
+ }
+ 
+ let counter = 0
+diff --git a/test/transcription-end.test.ts b/test/transcription-end.test.ts
+--- a/test/transcription-end.test.ts
++++ b/test/transcription-end.test.ts
+@@ -1,4 +1,5 @@
+ import { beforeEach, expect, it, vi } from 'vitest'
++vi.mock('cloudflare:workers', () => ({ env: {} }))
+ import { eq } from 'drizzle-orm'
+ 
+ import { transcriptionSessions, user } from '#/db/schema'

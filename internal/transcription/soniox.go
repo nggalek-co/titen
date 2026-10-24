@@ -20,10 +20,21 @@ type Client struct {
 	Dialer             *websocket.Dialer
 }
 type Update struct {
-	Partial string
-	Finals  []transcript.Segment
-	Err     error
+	Partial          string
+	Finals           []transcript.Segment
+	Err              error
+	ConnectionStatus ConnectionStatus
 }
+
+type ConnectionStatus uint8
+
+const (
+	ConnectionUnknown ConnectionStatus = iota
+	ConnectionConnecting
+	ConnectionConnected
+	ConnectionReconnecting
+)
+
 type token struct {
 	Text    string `json:"text"`
 	Start   int64  `json:"start_ms"`

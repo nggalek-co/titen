@@ -26,6 +26,7 @@ type Client struct {
 	HTTP              *http.Client
 	dialProvider      func(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error)
 	keepAliveInterval time.Duration
+	syncInterval      time.Duration
 }
 
 type DeviceCode struct {
@@ -225,18 +226,35 @@ func (c *Client) WaitDevice(ctx context.Context, code DeviceCode) (string, error
 }
 
 func (c *Client) Authorize(ctx context.Context, clientTag string) (Session, error) {
+	return c.authorize(ctx, clientTag, "")
+}
+
+func (c *Client) AuthorizeRenewal(ctx context.Context, meetingID string) (Session, error) {
+	if meetingID == "" {
+		return Session{}, errors.New("Titen meeting is missing for transcription renewal")
+	}
+	return c.authorize(ctx, "", meetingID)
+}
+
+func (c *Client) authorize(ctx context.Context, clientTag, meetingID string) (Session, error) {
 	var session Session
-	_, err := c.request(ctx, http.MethodPost, "/api/transcription-sessions", map[string]string{"clientTag": clientTag}, &session, true)
+	body := map[string]string{"clientTag": clientTag}
+	if meetingID != "" {
+		body["meetingId"] = meetingID
+	}
+	_, err := c.request(ctx, http.MethodPost, "/api/transcription-sessions", body, &session, true)
 	if err != nil {
 		return session, err
 	}
-	if session.SessionID == "" || session.MeetingID == "" || session.ReservationID == "" {
+	if session.SessionID == "" || session.MeetingID == "" || session.ReservationID == "" || (meetingID != "" && session.MeetingID != meetingID) {
 		return Session{}, errors.New("Titen server returned an invalid transcription session")
 	}
 	if err = session.validateProvider(); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		_ = c.End(cleanupCtx, session)
-		cancel()
+		if meetingID == "" {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_ = c.End(cleanupCtx, session)
+			cancel()
+		}
 		return Session{}, err
 	}
 	return session, nil

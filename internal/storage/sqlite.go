@@ -22,6 +22,7 @@ type Meeting struct {
 	Title            string     `json:"title"`
 	CreatedAt        time.Time  `json:"createdAt"`
 	EndedAt          *time.Time `json:"endedAt,omitempty"`
+	InterruptedAt    *time.Time `json:"interruptedAt,omitempty"`
 	DocumentID       string     `json:"documentId"`
 	NeedsDocument    bool       `json:"needsDocument"`
 	DocumentAttempts int        `json:"documentAttempts"`
@@ -136,6 +137,43 @@ func (s *Store) FinishMeeting(ctx context.Context, id string) error {
 	now := time.Now()
 	m.EndedAt = &now
 	return s.update(m)
+}
+func (s *Store) MarkMeetingInterrupted(ctx context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.meeting(id)
+	if err != nil {
+		return err
+	}
+	if m.InterruptedAt != nil {
+		return nil
+	}
+	now := time.Now()
+	m.InterruptedAt = &now
+	return s.update(m)
+}
+func (s *Store) RecoverInterruptedMeetings(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, err := s.rows("SELECT data FROM meetings WHERE json_extract(data,'$.endedAt') IS NULL AND json_extract(data,'$.interruptedAt') IS NULL")
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for _, row := range r {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var m Meeting
+		if err := json.Unmarshal([]byte(row[0]), &m); err != nil {
+			return err
+		}
+		m.InterruptedAt = &now
+		if err := s.update(m); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *Store) SetCloudMeeting(ctx context.Context, id, endpoint, remoteID string) error {
 	s.mu.Lock()

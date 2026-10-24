@@ -17,7 +17,7 @@ type CaptureConfig struct {
 	ExitCode        int
 	ExitImmediately bool
 	IgnoreStop      bool
-	InterruptMarker string
+	Interruptions   int
 }
 
 var fixture struct {

@@ -29,6 +29,7 @@ import (
 	"titen/internal/saas"
 	"titen/internal/storage"
 	"titen/internal/transcript"
+	"titen/internal/transcription"
 	"titen/locales"
 )
 
@@ -196,15 +197,6 @@ func (d *desktop) start() {
 		}
 	}
 	d.async(func() error {
-		budget, err := (&saas.Client{BaseURL: cfg.ServerEndpoint, Token: key}).Budget(d.root)
-		status := classifyBudget(budget, err)
-		d.win.Update(func() { d.endpoint = status })
-		switch status.health {
-		case endpointDown:
-			return errors.New(locales.Tf("recordingDidNotStart", map[string]any{"detail": locales.T(status.detailKey)}))
-		case endpointAttention:
-			return errors.New(locales.Tf("openSettingsHint", map[string]any{"detail": locales.T(status.detailKey)}))
-		}
 		if strings.TrimSpace(title) == "" {
 			title = "Meeting " + time.Now().Format("2006-01-02 15:04")
 		}
@@ -595,6 +587,20 @@ func (d *desktop) view(c *ui.Context) {
 				components.Text(c, d.tr(c, "localTranscriptSaved")).FontSize(11).TextColor(t.TextMuted)
 			})
 			ui.Spacer(c)
+			switch d.snapshot.TranscriptionStatus {
+			case transcription.ConnectionConnecting:
+				ui.Row(c).Padding(3, 10).Radius(999).Border(1, t.Warning).Children(func() {
+					components.Text(c, d.tr(c, "transcriptionConnecting")).FontSize(11).FontWeight(500).TextColor(t.Warning).SingleLine()
+				})
+			case transcription.ConnectionConnected:
+				ui.Row(c).Padding(3, 10).Radius(999).Border(1, t.Success).Children(func() {
+					components.Text(c, d.tr(c, "transcriptionConnected")).FontSize(11).FontWeight(500).TextColor(t.Success).SingleLine()
+				})
+			case transcription.ConnectionReconnecting:
+				ui.Row(c).Padding(3, 10).Radius(999).Border(1, t.Warning).Children(func() {
+					components.Text(c, d.tr(c, "transcriptionReconnecting")).FontSize(11).FontWeight(500).TextColor(t.Warning).SingleLine()
+				})
+			}
 			if d.snapshot.Error != "" {
 				ui.Row(c).Padding(3, 10).Radius(999).Border(1, t.Danger).Children(func() {
 					components.Text(c, d.snapshot.Error).FontSize(11).FontWeight(500).TextColor(t.Danger).SingleLine()
@@ -836,6 +842,9 @@ func (d *desktop) historyView(c *ui.Context) {
 							}
 							ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 								components.Text(c, meta).FontSize(11).TextColor(t.TextMuted)
+								if m.InterruptedAt != nil {
+									components.Badge(c, d.tr(c, "interruptedMeeting"))
+								}
 								if m.DocumentID != "" {
 									components.Badge(c, d.tr(c, "synced"))
 								}
@@ -880,6 +889,20 @@ func (d *desktop) historyView(c *ui.Context) {
 				})
 			})
 			ui.Divider(c)
+			if activeMeeting != nil && activeMeeting.InterruptedAt != nil {
+				lastFinalMS := int64(-1)
+				for _, segment := range d.detail {
+					if segment.EndMS > lastFinalMS {
+						lastFinalMS = segment.EndMS
+					}
+				}
+				message := d.tr(c, "interruptedTranscript")
+				if lastFinalMS >= 0 {
+					stamp := fmt.Sprintf("%02d:%02d", lastFinalMS/60000, lastFinalMS/1000%60)
+					message = d.trf(c, "interruptedTranscriptAfter", map[string]any{"time": stamp})
+				}
+				components.Text(c, message).FontSize(12).TextColor(t.TextMuted)
+			}
 			ui.Scroll(c.Key("detail")).Grow(1).FillWidth().Gap(8).Children(func() {
 				if len(d.detail) == 0 {
 					ui.Column(c).Grow(1).Padding(32, 16).Center().Gap(6).Radius(t.Radius).Border(1, t.Border).Children(func() {
@@ -1178,6 +1201,10 @@ func main() {
 	defer store.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if err := store.RecoverInterruptedMeetings(ctx); err != nil {
+		slog.Error("recover interrupted meetings", "error", err)
+		os.Exit(1)
+	}
 	endpoint := cfg.ServerEndpoint
 	token, _ := auth.GetSecret(saas.TokenKey(endpoint))
 	d := &desktop{service: app.NewService(store), store: store, dir: dir, settings: cfg, endpointInput: endpoint, deviceToken: token, page: "Record", root: ctx, cancel: cancel, microphone: "System default"}

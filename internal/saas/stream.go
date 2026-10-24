@@ -3,6 +3,7 @@ package saas
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -22,6 +23,42 @@ type providerUpdate struct {
 	update   transcription.Update
 	finished bool
 	err      error
+}
+
+var errTranscriptSyncDeferred = errors.New("Titen transcript upload will retry")
+var errProviderInterrupted = errors.New("Soniox connection interrupted")
+
+type streamCursor struct {
+	sequence       int
+	pending        []cloudSegment
+	retryAudio     []byte
+	audioBytesSent int64
+}
+
+const pcmBytesPerSecond = 16000 * 2
+
+func (cursor *streamCursor) offsetMs() int64 {
+	return cursor.audioBytesSent * 1000 / pcmBytesPerSecond
+}
+
+func providerInterrupted(message string) error {
+	return fmt.Errorf("%w: %s", errProviderInterrupted, message)
+}
+
+func transientBackendError(err error) bool {
+	if errors.Is(err, ErrUnavailable) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && (apiErr.Status == 429 || apiErr.Status >= 500)
+}
+
+func transientRenewalError(err error) bool {
+	if transientBackendError(err) {
+		return true
+	}
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == 409
 }
 
 func (c *Client) Run(ctx context.Context, audio <-chan []byte, notify func(transcription.Update)) error {
@@ -48,12 +85,6 @@ func (c *Client) syncSegments(ctx context.Context, sessionID string, segments []
 }
 
 func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byte, notify func(transcription.Update)) (result error) {
-	if c.Token == "" {
-		return errors.New("sign in to your Titen account in Settings")
-	}
-	if session.SessionID == "" {
-		return errors.New("Titen transcription session is missing")
-	}
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
@@ -61,8 +92,157 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 			result = errors.New("Titen could not finalize the session; transcript remains saved on this device")
 		}
 	}()
-	if err := session.validateProvider(); err != nil {
+	cursor := &streamCursor{}
+	_, result = c.streamGrant(ctx, session, audio, notify, cursor, 0, nil, nil)
+	return result
+}
+
+// StreamMeeting rotates short provider grants without ending the server meeting.
+func (c *Client) StreamMeeting(ctx context.Context, session Session, audio <-chan []byte, notify func(transcription.Update), changed func(string)) (result error) {
+	current := session
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := c.End(cleanupCtx, current); err != nil && result == nil {
+			result = errors.New("Titen could not finalize the session; transcript remains saved on this device")
+		}
+	}()
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	spoolFailure := make(chan error, 1)
+	spooled, cleanup, err := transcription.Spool(streamCtx, audio, func(err error) {
+		select {
+		case spoolFailure <- err:
+		default:
+		}
+		cancelStream()
+	})
+	if err != nil {
 		return err
+	}
+	defer cleanup()
+	cursor := &streamCursor{}
+	reconnectDelay := 250 * time.Millisecond
+	waitReconnect := func() error {
+		timer := time.NewTimer(reconnectDelay)
+		reconnectDelay = min(reconnectDelay*2, 5*time.Second)
+		defer timer.Stop()
+		select {
+		case err := <-spoolFailure:
+			return err
+		case <-streamCtx.Done():
+			select {
+			case err := <-spoolFailure:
+				return err
+			default:
+				return streamCtx.Err()
+			}
+		case <-timer.C:
+			return nil
+		}
+	}
+	for {
+		if changed != nil {
+			changed(current.SessionID)
+		}
+		rotate := make(chan Session)
+		renewalFailure := make(chan error, 1)
+		grantCtx, cancel := context.WithCancel(streamCtx)
+		go func(s Session) {
+			grantEnd := s.ExpiresAt.Add(time.Duration(s.MaxSessionDurationSeconds) * time.Second)
+			wait := time.Until(grantEnd.Add(-90 * time.Second))
+			if wait > 0 {
+				timer := time.NewTimer(wait)
+				defer timer.Stop()
+				select {
+				case <-grantCtx.Done():
+					return
+				case <-timer.C:
+				}
+			}
+			for grantCtx.Err() == nil {
+				next, err := c.AuthorizeRenewal(grantCtx, s.MeetingID)
+				if err == nil {
+					select {
+					case rotate <- next:
+					case <-grantCtx.Done():
+						cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+						_ = c.End(cleanupCtx, next)
+						cleanupCancel()
+					}
+					return
+				}
+				if !transientRenewalError(err) {
+					select {
+					case renewalFailure <- err:
+					case <-grantCtx.Done():
+					}
+					return
+				}
+				timer := time.NewTimer(5 * time.Second)
+				select {
+				case <-grantCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		}(current)
+		next, err := c.streamGrant(streamCtx, current, spooled, notify, cursor, cursor.offsetMs(), rotate, renewalFailure)
+		cancel()
+		if next != nil {
+			current = *next
+		}
+		if err != nil {
+			select {
+			case spoolErr := <-spoolFailure:
+				return spoolErr
+			default:
+			}
+			if streamCtx.Err() != nil {
+				return streamCtx.Err()
+			}
+			if !errors.Is(err, errProviderInterrupted) {
+				return err
+			}
+			if notify != nil {
+				notify(transcription.Update{ConnectionStatus: transcription.ConnectionReconnecting})
+			}
+			for {
+				if err := waitReconnect(); err != nil {
+					return err
+				}
+				if next != nil {
+					break
+				}
+				replacement, err := c.AuthorizeRenewal(streamCtx, current.MeetingID)
+				if err == nil {
+					current = replacement
+					break
+				}
+				if !transientRenewalError(err) {
+					return err
+				}
+			}
+			continue
+		}
+		reconnectDelay = 250 * time.Millisecond
+		if next == nil {
+			return nil
+		}
+	}
+}
+
+func (c *Client) streamGrant(ctx context.Context, session Session, audio <-chan []byte, notify func(transcription.Update), cursor *streamCursor, offsetMs int64, rotate <-chan Session, renewalFailure <-chan error) (next *Session, result error) {
+	renewable := rotate != nil
+	if c.Token == "" {
+		return nil, errors.New("sign in to your Titen account in Settings")
+	}
+	if session.SessionID == "" {
+		return nil, errors.New("Titen transcription session is missing")
+	}
+	if err := session.validateProvider(); err != nil {
+		return nil, err
 	}
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 20 * time.Second
@@ -76,9 +256,9 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 			resp.Body.Close()
 		}
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
-		return errors.New("Soniox connection failed; start a new session for fresh temporary credentials")
+		return nil, providerInterrupted("Soniox connection failed")
 	}
 	defer conn.Close()
 	conn.SetReadLimit(4 << 20)
@@ -88,7 +268,18 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 		"num_channels": 1, "language_hints": []string{"id", "en"},
 		"enable_speaker_diarization": true, "enable_endpoint_detection": true,
 	}); err != nil {
-		return errors.New("Soniox stream configuration failed")
+		return nil, providerInterrupted("Soniox stream configuration failed")
+	}
+	if notify != nil {
+		notify(transcription.Update{ConnectionStatus: transcription.ConnectionConnected})
+	}
+	if len(cursor.retryAudio) > 0 {
+		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := conn.WriteMessage(websocket.BinaryMessage, cursor.retryAudio); err != nil {
+			return nil, providerInterrupted("Soniox audio upload failed")
+		}
+		cursor.audioBytesSent += int64(len(cursor.retryAudio))
+		cursor.retryAudio = nil
 	}
 
 	updates := make(chan providerUpdate, 64)
@@ -100,9 +291,13 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 			_, raw, readErr := conn.ReadMessage()
 			event := providerUpdate{}
 			if readErr != nil {
-				event.err = errors.New("Soniox disconnected; start a new session for fresh temporary credentials")
+				event.err = providerInterrupted("Soniox disconnected")
 			} else {
 				event.update, event.finished, event.err = assembler.Update(raw)
+				for i := range event.update.Finals {
+					event.update.Finals[i].StartMS += offsetMs
+					event.update.Finals[i].EndMS += offsetMs
+				}
 				if event.err != nil {
 					event.err = errors.New("Soniox rejected the stream or its session duration expired")
 				}
@@ -116,25 +311,26 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 			}
 		}
 	}()
-	pending := make([]cloudSegment, 0, 100)
-	sequence := 0
 	appendFinals := func(u transcription.Update) {
 		for _, segment := range u.Finals {
-			sequence++
-			pending = append(pending, cloudSegment{sequence, segment.Text, segment.Speaker, segment.StartMS, segment.EndMS})
+			cursor.sequence++
+			cursor.pending = append(cursor.pending, cloudSegment{cursor.sequence, segment.Text, segment.Speaker, segment.StartMS, segment.EndMS})
 		}
 	}
 	flush := func(syncCtx context.Context) error {
-		if len(pending) == 0 {
+		if len(cursor.pending) == 0 {
 			return nil
 		}
-		count := min(100, len(pending))
+		count := min(100, len(cursor.pending))
 		requestCtx, cancel := context.WithTimeout(syncCtx, 5*time.Second)
 		defer cancel()
-		if err := c.syncSegments(requestCtx, session.SessionID, pending[:count]); err != nil {
+		if err := c.syncSegments(requestCtx, session.SessionID, cursor.pending[:count]); err != nil {
+			if renewable && transientBackendError(err) {
+				return errTranscriptSyncDeferred
+			}
 			return errors.New("Titen transcript sync failed; transcript remains saved on this device")
 		}
-		pending = pending[count:]
+		cursor.pending = cursor.pending[count:]
 		return nil
 	}
 
@@ -148,10 +344,25 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 				for len(updates) > 0 {
 					appendFinals((<-updates).update)
 				}
+				if renewable && (errors.Is(result, errProviderInterrupted) || (next != nil && result == nil)) {
+					return
+				}
 				syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 				defer cancel()
-				for len(pending) > 0 {
+				for len(cursor.pending) > 0 {
 					if err := flush(syncCtx); err != nil {
+						if errors.Is(err, errTranscriptSyncDeferred) && syncCtx.Err() == nil {
+							timer := time.NewTimer(time.Second)
+							select {
+							case <-timer.C:
+							case <-syncCtx.Done():
+								timer.Stop()
+							}
+							continue
+						}
+						if errors.Is(err, errTranscriptSyncDeferred) {
+							err = errors.New("Titen transcript sync timed out; transcript remains saved on this device")
+						}
 						result = errors.Join(result, err)
 						break
 					}
@@ -160,7 +371,11 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 			}
 		}
 	}()
-	ticker := time.NewTicker(5 * time.Second)
+	syncInterval := c.syncInterval
+	if syncInterval <= 0 {
+		syncInterval = 5 * time.Second
+	}
+	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
 	keepAliveInterval := c.keepAliveInterval
 	if keepAliveInterval <= 0 {
@@ -180,40 +395,64 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return next, ctx.Err()
 		case <-duration.C:
-			return errors.New("Soniox session duration reached; start a new recording to continue")
+			if renewable {
+				return next, providerInterrupted("Soniox session duration reached before renewal completed")
+			}
+			return next, errors.New("Soniox session duration reached before renewal completed")
+		case err := <-renewalFailure:
+			return next, err
+		case replacement := <-rotate:
+			next = &replacement
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.TextMessage, nil); err != nil {
+				return next, errors.New("Soniox could not finish the transcription stream")
+			}
+			audio = nil
+			rotate = nil
+			timer = time.NewTimer(15 * time.Second)
+			finalization = timer.C
 		case event := <-updates:
 			appendFinals(event.update)
+			if len(cursor.pending) > 1000 {
+				return next, errors.New("Titen transcript upload queue is full; transcript remains saved on this device")
+			}
 			if event.err != nil {
-				return event.err
+				if audio == nil && errors.Is(event.err, errProviderInterrupted) {
+					return next, errors.New("Soniox disconnected before finalizing; unfinalized speech may be missing")
+				}
+				return next, event.err
 			}
 			if event.finished {
-				return nil
+				if renewable && audio != nil && next == nil {
+					return next, providerInterrupted("Soniox stream ended before transcription renewal completed")
+				}
+				return next, nil
 			}
-			if len(pending) >= 100 {
-				if err := flush(ctx); err != nil {
-					return err
+			if len(cursor.pending) >= 100 {
+				if err := flush(ctx); err != nil && !errors.Is(err, errTranscriptSyncDeferred) {
+					return next, err
 				}
 			}
 		case <-ticker.C:
-			if err := flush(ctx); err != nil {
-				return err
+			if err := flush(ctx); err != nil && !errors.Is(err, errTranscriptSyncDeferred) {
+				return next, err
 			}
 		case <-keepAlive.C:
 			if audio != nil {
 				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if err := conn.WriteJSON(map[string]string{"type": "keepalive"}); err != nil {
-					return errors.New("Soniox keepalive failed; start a new session to reconnect")
+					return next, providerInterrupted("Soniox keepalive failed")
 				}
 			}
 		case <-finalization:
-			return errors.New("Soniox transcription finalization timed out")
+			return next, errors.New("Soniox transcription finalization timed out")
 		case pcm, ok := <-audio:
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
 				if err := conn.WriteMessage(websocket.TextMessage, nil); err != nil {
-					return errors.New("Soniox could not finish the transcription stream")
+					return next, errors.New("Soniox could not finish the transcription stream")
 				}
 				audio = nil
 				timer = time.NewTimer(15 * time.Second)
@@ -224,11 +463,13 @@ func (c *Client) Stream(ctx context.Context, session Session, audio <-chan []byt
 				continue
 			}
 			if len(pcm)%2 != 0 {
-				return errors.New("Titen requires 16-bit mono PCM audio")
+				return next, errors.New("Titen requires 16-bit mono PCM audio")
 			}
 			if err := conn.WriteMessage(websocket.BinaryMessage, pcm); err != nil {
-				return errors.New("Soniox audio upload failed; start a new session to reconnect")
+				cursor.retryAudio = pcm
+				return next, providerInterrupted("Soniox audio upload failed")
 			}
+			cursor.audioBytesSent += int64(len(pcm))
 		}
 	}
 }

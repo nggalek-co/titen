@@ -26,6 +26,8 @@ const (
 	Stopping  State = "Finishing"
 )
 
+const preAuthorizationAudioChunks = 1250
+
 type Snapshot struct {
 	State                        State
 	MeetingID                    string
@@ -35,6 +37,7 @@ type Snapshot struct {
 	MicrophoneLevel, SystemLevel float64
 	MinutesLeft                  int
 	MinutesKnown                 bool
+	TranscriptionStatus          transcription.ConnectionStatus
 	Error                        string
 }
 
@@ -52,8 +55,11 @@ type Service struct {
 	began           time.Time
 	elapsed         time.Duration
 	run             func(context.Context, <-chan []byte, func(transcription.Update)) error
+	authorize       func(context.Context, *saas.Client, string) (saas.Session, error)
 	beat            func(context.Context, string) (saas.Heartbeat, error)
 	beatInterval    time.Duration
+	sessionID       string
+	incomplete      bool
 	finishTimeout   time.Duration
 	seen            map[string]bool
 	captureRestarts int
@@ -84,6 +90,13 @@ func (s *Service) fail(err error) {
 	slog.Warn("meeting issue", "meeting_id", id, "state", state, "error", err)
 }
 
+func (s *Service) failIncomplete(err error) {
+	s.mu.Lock()
+	s.incomplete = true
+	s.mu.Unlock()
+	s.fail(err)
+}
+
 func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) error {
 	s.op.Lock()
 	defer s.op.Unlock()
@@ -94,53 +107,76 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 		return errors.New("sign in to your Titen account in Settings first")
 	}
 	s.mu.Lock()
-	s.state = Snapshot{State: Starting}
+	s.state = Snapshot{State: Starting, TranscriptionStatus: transcription.ConnectionConnecting}
 	s.mu.Unlock()
 	client := &saas.Client{BaseURL: cfg.ServerEndpoint, Token: key}
 	var session saas.Session
-	var err error
-	if s.run == nil {
-		session, err = client.Authorize(ctx, title)
-		if err != nil {
-			s.setIdle()
-			return err
-		}
-	}
-	cleanupSession := func() {
-		if session.SessionID != "" {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = client.End(cleanupCtx, session)
-		}
-	}
 	meeting, err := s.Store.CreateMeeting(ctx, title)
 	if err != nil {
-		cleanupSession()
 		s.setIdle()
 		return err
 	}
-	if session.MeetingID != "" {
-		if err = s.Store.SetCloudMeeting(ctx, meeting.ID, cfg.ServerEndpoint, session.MeetingID); err != nil {
-			cleanupSession()
-			s.setIdle()
-			_ = s.Store.FinishMeeting(ctx, meeting.ID)
-			return err
-		}
-	}
-
 	s.mu.Lock()
-	s.state.MeetingID = meeting.ID
+	s.state = Snapshot{State: Starting, MeetingID: meeting.ID, TranscriptionStatus: transcription.ConnectionConnecting}
 	s.state.MinutesKnown = false
 	s.elapsed = 0
 	s.settings = cfg
 	s.seen = make(map[string]bool)
+	s.sessionID = ""
 	s.captureRestarts = 0
+	s.incomplete = false
 	s.mu.Unlock()
 	streamCtx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
-	s.chunks = make(chan []byte, 250)
+	s.chunks = make(chan []byte, preAuthorizationAudioChunks)
+	chunks := s.chunks
+	finishFailedStart := func(cause error) error {
+		if s.capture != nil {
+			s.endCapture()
+		}
+		close(chunks)
+		cancel()
+		s.failIncomplete(cause)
+		markErr := s.Store.MarkMeetingInterrupted(context.Background(), meeting.ID)
+		finishErr := s.Store.FinishMeeting(context.Background(), meeting.ID)
+		s.setIdle()
+		return errors.Join(cause, markErr, finishErr)
+	}
+	if err := s.beginCapture(streamCtx); err != nil {
+		return finishFailedStart(err)
+	}
+
+	authorize := s.authorize
+	if authorize == nil && s.run == nil {
+		authorize = func(ctx context.Context, client *saas.Client, title string) (saas.Session, error) {
+			return client.Authorize(ctx, title)
+		}
+	}
+	if authorize != nil {
+		session, err = authorize(ctx, client, title)
+		if err != nil {
+			return finishFailedStart(err)
+		}
+	}
+	cleanupSession := func() {
+		if session.SessionID != "" {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			_ = client.End(cleanupCtx, session)
+		}
+	}
+	if session.MeetingID != "" {
+		if err = s.Store.SetCloudMeeting(ctx, meeting.ID, cfg.ServerEndpoint, session.MeetingID); err != nil {
+			cleanupSession()
+			return finishFailedStart(err)
+		}
+	}
+	s.mu.Lock()
+	s.sessionID = session.SessionID
+	s.mu.Unlock()
+
 	s.networkDone = make(chan struct{})
-	chunks, done := s.chunks, s.networkDone
+	done := s.networkDone
 	if beat := s.beat; beat != nil || session.SessionID != "" {
 		if beat == nil {
 			beat = client.Beat
@@ -149,19 +185,28 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 		if interval <= 0 {
 			interval = 30 * time.Second
 		}
-		go s.heartbeat(streamCtx, cancel, meeting.ID, session.SessionID, beat, interval)
+		go s.heartbeat(streamCtx, cancel, meeting.ID, beat, interval)
 	}
 	go func() {
 		defer close(done)
 		run := s.run
 		if run == nil {
 			run = func(ctx context.Context, chunks <-chan []byte, notify func(transcription.Update)) error {
-				return client.Stream(ctx, session, chunks, notify)
+				return client.StreamMeeting(ctx, session, chunks, notify, func(id string) {
+					s.mu.Lock()
+					if s.state.MeetingID == meeting.ID {
+						s.sessionID = id
+					}
+					s.mu.Unlock()
+				})
 			}
 		}
 		err := run(streamCtx, chunks, func(update transcription.Update) {
 			s.mu.Lock()
 			active := s.state.MeetingID == meeting.ID && s.state.State != Idle
+			if active && update.ConnectionStatus != transcription.ConnectionUnknown {
+				s.state.TranscriptionStatus = update.ConnectionStatus
+			}
 			s.mu.Unlock()
 			if !active {
 				return
@@ -197,6 +242,9 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 				}
 			}
 		})
+		if err != nil && streamCtx.Err() == nil {
+			s.failIncomplete(err)
+		}
 		go func() {
 			s.op.Lock()
 			defer s.op.Unlock()
@@ -204,30 +252,23 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 			if snap.MeetingID != meeting.ID || snap.State == Idle {
 				return
 			}
-			if err != nil && streamCtx.Err() == nil {
-				s.fail(err)
-			}
-			if snap.Error == "" && err == nil {
-				s.fail(errors.New("transcription stream ended; meeting was stopped"))
+			if err == nil {
+				if snap.Error == "" {
+					s.failIncomplete(errors.New("transcription stream ended; meeting was stopped"))
+				} else {
+					s.mu.Lock()
+					s.incomplete = true
+					s.mu.Unlock()
+				}
 			}
 			_ = s.stop(context.Background())
 		}()
 	}()
-	if err = s.beginCapture(streamCtx); err != nil {
-		close(s.chunks)
-		cancel()
-		s.waitNetwork(context.Background(), done)
-		s.fail(err)
-		s.setIdle()
-		cleanupSession()
-		_ = s.Store.FinishMeeting(ctx, meeting.ID)
-		return err
-	}
 	slog.Info("meeting started", "meeting_id", meeting.ID)
 	return nil
 }
 
-func (s *Service) heartbeat(ctx context.Context, cancel context.CancelFunc, meetingID, sessionID string, beat func(context.Context, string) (saas.Heartbeat, error), interval time.Duration) {
+func (s *Service) heartbeat(ctx context.Context, cancel context.CancelFunc, meetingID string, beat func(context.Context, string) (saas.Heartbeat, error), interval time.Duration) {
 	timer := time.NewTicker(interval)
 	defer timer.Stop()
 	for {
@@ -236,6 +277,9 @@ func (s *Service) heartbeat(ctx context.Context, cancel context.CancelFunc, meet
 			return
 		case <-timer.C:
 		}
+		s.mu.Lock()
+		sessionID := s.sessionID
+		s.mu.Unlock()
 		res, err := beat(ctx, sessionID)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -253,9 +297,9 @@ func (s *Service) heartbeat(ctx context.Context, cancel context.CancelFunc, meet
 			continue
 		}
 		if res.Reason == "insufficient_funds" {
-			s.fail(errors.New("Titen credit exhausted; top up your account on the website"))
+			s.failIncomplete(errors.New("Titen credit exhausted; top up your account on the website"))
 		} else {
-			s.fail(errors.New("Titen session ended on the server"))
+			s.failIncomplete(errors.New("Titen session ended on the server"))
 		}
 		cancel()
 		return
@@ -291,7 +335,7 @@ func (s *Service) beginCapture(ctx context.Context) error {
 			select {
 			case chunks <- chunk.PCM:
 			default:
-				s.fail(errors.New("transcription is behind; audio was dropped from the bounded buffer"))
+				s.failIncomplete(errors.New("transcription is behind; audio was dropped from the bounded buffer"))
 			}
 			return nil
 		})
@@ -299,34 +343,92 @@ func (s *Service) beginCapture(ctx context.Context) error {
 			s.fail(err)
 		}
 		<-errorsDone
-		go func() {
-			s.op.Lock()
-			defer s.op.Unlock()
-			if s.capture == cap {
-				snap := s.Snapshot()
-				if snap.State == Recording && strings.Contains(snap.Error, "Capture interrupted") && s.captureRestarts < 3 && ctx.Err() == nil {
-					s.captureRestarts++
-					s.mu.Lock()
-					s.elapsed += time.Since(s.began)
-					s.state.State = Paused
-					s.state.Error = fmt.Sprintf("Capture interrupted. Recovery attempt %d of 3", s.captureRestarts)
-					s.mu.Unlock()
-					s.capture = nil
-					if err := s.beginCapture(ctx); err == nil {
-						return
-					} else {
-						s.fail(err)
-					}
-				}
-				if s.Snapshot().Error == "" {
-					s.fail(errors.New("audio capture ended; meeting was stopped"))
-				}
-				_ = s.stop(context.Background())
-			}
-		}()
+		go s.recoverCapture(ctx, cap, s.Snapshot().MeetingID)
 	}()
 	return nil
 }
+
+func (s *Service) recoverCapture(ctx context.Context, failed *audio.Capture, meetingID string) {
+	s.op.Lock()
+	if s.capture != failed || s.Snapshot().State != Recording || ctx.Err() != nil {
+		s.op.Unlock()
+		return
+	}
+	issue := s.Snapshot().Error
+	s.capture = nil
+	if requiresCapturePermissionFix(issue) {
+		s.mu.Lock()
+		s.incomplete = true
+		s.mu.Unlock()
+		_ = failed.Close()
+		s.op.Unlock()
+		_ = s.Stop(context.Background())
+		return
+	}
+	s.captureRestarts++
+	retry := time.Second
+	for n := 1; n < s.captureRestarts && retry < 30*time.Second; n++ {
+		retry = min(retry*2, 30*time.Second)
+	}
+	s.mu.Lock()
+	s.elapsed += time.Since(s.began)
+	s.began = time.Now()
+	s.incomplete = true
+	s.state.Error = "Audio capture was interrupted; retrying automatically"
+	s.mu.Unlock()
+	_ = failed.Close()
+	s.op.Unlock()
+
+	for ctx.Err() == nil {
+		timer := time.NewTimer(retry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		s.op.Lock()
+		snap := s.Snapshot()
+		if snap.MeetingID != meetingID || snap.State != Recording || s.capture != nil || ctx.Err() != nil {
+			s.op.Unlock()
+			return
+		}
+		s.mu.Lock()
+		s.elapsed += time.Since(s.began)
+		s.began = time.Now()
+		s.mu.Unlock()
+		if err := s.beginCapture(ctx); err == nil {
+			s.mu.Lock()
+			if strings.HasPrefix(s.state.Error, "Audio capture was interrupted;") || strings.HasPrefix(s.state.Error, "Audio capture unavailable;") {
+				s.state.Error = ""
+			}
+			s.mu.Unlock()
+			attempt := s.captureRestarts
+			s.op.Unlock()
+			slog.Info("audio capture recovered", "meeting_id", meetingID, "attempt", attempt)
+			return
+		} else {
+			s.captureRestarts++
+			s.mu.Lock()
+			s.state.Error = fmt.Sprintf("Audio capture unavailable; retrying automatically: %v", err)
+			s.mu.Unlock()
+			s.op.Unlock()
+			retry = min(retry*2, 30*time.Second)
+		}
+	}
+}
+
+func requiresCapturePermissionFix(message string) bool {
+	message = strings.ToLower(message)
+	for _, marker := range []string{"permission denied", "access denied", "not authorized", "tcc"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Service) Pause() error {
 	s.op.Lock()
 	defer s.op.Unlock()
@@ -380,12 +482,26 @@ func (s *Service) stop(ctx context.Context) error {
 	close(s.chunks)
 	s.waitNetwork(ctx, s.networkDone)
 	s.cancel()
+	s.mu.Lock()
+	incomplete := s.incomplete
+	s.mu.Unlock()
+	if incomplete {
+		if err := s.Store.MarkMeetingInterrupted(context.Background(), snap.MeetingID); err != nil {
+			s.fail(fmt.Errorf("mark interrupted meeting: %w", err))
+		}
+	}
 	err := s.Store.FinishMeeting(context.Background(), snap.MeetingID)
 	s.setIdle()
 	slog.Info("meeting stopped", "meeting_id", snap.MeetingID)
 	return err
 }
-func (s *Service) setIdle() { s.mu.Lock(); s.state.State = Idle; s.state.Partial = ""; s.mu.Unlock() }
+func (s *Service) setIdle() {
+	s.mu.Lock()
+	s.state.State = Idle
+	s.state.Partial = ""
+	s.state.TranscriptionStatus = transcription.ConnectionUnknown
+	s.mu.Unlock()
+}
 
 func (s *Service) waitNetwork(ctx context.Context, done <-chan struct{}) {
 	timeout := s.finishTimeout
@@ -397,9 +513,9 @@ func (s *Service) waitNetwork(ctx context.Context, done <-chan struct{}) {
 	select {
 	case <-done:
 	case <-timer.C:
-		s.fail(errors.New("Server finalization timed out; unfinalized speech may be missing"))
+		s.failIncomplete(errors.New("Server finalization timed out; unfinalized speech may be missing"))
 	case <-ctx.Done():
-		s.fail(ctx.Err())
+		s.failIncomplete(ctx.Err())
 	}
 }
 
