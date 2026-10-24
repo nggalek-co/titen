@@ -162,11 +162,10 @@ if [ -n "${TITEN_CODESIGN_KEYCHAIN_PASSWORD:-}" ]; then
 	security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
 		-k "$TITEN_CODESIGN_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
 fi
-echo "Trusting the self-signed code-signing certificate in the selected keychain."
 if [ "${TITEN_CODESIGN_CI:-0}" = 1 ]; then
-	sudo -n security add-trusted-cert -d -r trustRoot -p codeSign \
-		-k /Library/Keychains/System.keychain "$tmp_dir/cert.pem" >/dev/null
+	echo "Using the self-signed certificate only in the job keychain."
 else
+	echo "Trusting the self-signed code-signing certificate in the selected keychain."
 	security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$tmp_dir/cert.pem" >/dev/null
 fi
 
