@@ -29,6 +29,16 @@ esac
 go build -trimpath -ldflags "-s -w -X main.version=$version$production_ldflag" -o "$bundle/Contents/MacOS/titen" .
 cp native/macos/.build/release/titen-audio "$bundle/Contents/MacOS/titen-audio"
 cp resources/icon.png "$bundle/Contents/Resources/icon.png"
+iconset="build/icon.iconset"
+rm -rf "$iconset"
+mkdir -p "$iconset"
+go run ./cmd/prepare-icon resources/icon.png build/icon-macos.png
+for size in 16 32 128 256 512; do
+  sips -z "$size" "$size" build/icon-macos.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+  sips -z "$((size * 2))" "$((size * 2))" build/icon-macos.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+rm -f "$bundle/Contents/Resources/icon.icns"
+iconutil -c icns "$iconset" -o "$bundle/Contents/Resources/icon.icns"
 cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,6 +48,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <key>CFBundleIdentifier</key><string>$TITEN_APP_BUNDLE_ID</string>
 <key>CFBundleExecutable</key><string>titen</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>icon</string>
 <key>CFBundleShortVersionString</key><string>$bundle_version</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import AVFoundation
 import ScreenCaptureKit
 import CoreMedia
@@ -186,6 +187,7 @@ struct PermissionStatus: Encodable {
 
 @main struct AudioMain {
     static func main() async {
+        NSApplication.shared.setActivationPolicy(.prohibited)
         signal(SIGPIPE, SIG_IGN)
         if CommandLine.arguments.contains("--check-permissions") || CommandLine.arguments.contains("--request-permissions") {
             let request = CommandLine.arguments.contains("--request-permissions")

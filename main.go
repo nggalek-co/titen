@@ -3,10 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"image"
-	"image/color"
+	"image/draw"
 	"image/png"
 	"io"
 	"log/slog"
@@ -24,9 +25,11 @@ import (
 	"github.com/oneo-me/onevra/source/components"
 	"github.com/oneo-me/onevra/source/icons/lucide"
 	"github.com/oneo-me/onevra/source/shells/sidebar"
+	xdraw "golang.org/x/image/draw"
 	"titen/internal/app"
 	"titen/internal/audio"
 	"titen/internal/auth"
+	"titen/internal/branding"
 	"titen/internal/platform"
 	"titen/internal/saas"
 	"titen/internal/storage"
@@ -668,16 +671,6 @@ func (d *desktop) recordView(c *ui.Context) {
 		ui.Divider(c)
 		microphone := d.settings.CaptureMode != "System audio only"
 		system := d.settings.CaptureMode != "Microphone only"
-		ui.Row(c).Gap(18).Children(func() {
-			mic := components.Checkbox(c, &microphone, d.tr(c, "microphone")).Disabled(d.busy || s.State != app.Idle && s.State != app.Paused || microphone && !system)
-			if mic.Changed() {
-				d.setCaptureInputs(microphone, system)
-			}
-			sys := components.Checkbox(c, &system, d.tr(c, "systemAudio")).Disabled(d.busy || s.State != app.Idle && s.State != app.Paused || system && !microphone)
-			if sys.Changed() {
-				d.setCaptureInputs(microphone, system)
-			}
-		})
 		ui.Row(c).Gap(12).Wrap().Children(func() {
 			ui.Column(c).Grow(2).MinWidth(240).Gap(5).Children(func() {
 				components.Text(c, d.tr(c, "sessionTitle")).FontSize(11).FontWeight(600).TextColor(t.TextMuted)
@@ -688,7 +681,11 @@ func (d *desktop) recordView(c *ui.Context) {
 		ui.Row(c).Gap(14).Wrap().Children(func() {
 			ui.Column(c).Grow(1).MinWidth(220).Padding(10, 14).Gap(8).Radius(t.Radius).Border(1, t.Border).Children(func() {
 				ui.Row(c).AlignItems(ui.Center).Children(func() {
-					components.Icon(c, lucide.Mic()).Size(13, 13)
+					mic := components.Checkbox(c.Key("capture-microphone"), &microphone, "").Label(d.tr(c, "microphone")).Disabled(d.busy || s.State != app.Idle && s.State != app.Paused || microphone && !system)
+					if mic.Changed() {
+						d.setCaptureInputs(microphone, system)
+					}
+					components.Icon(c, lucide.Mic()).Size(13, 13).MarginStart(10)
 					components.Text(c, d.tr(c, "microphone")).FontSize(12).FontWeight(600).MarginStart(6)
 					ui.Spacer(c)
 					components.Text(c, fmt.Sprintf("%d%%", int(s.MicrophoneLevel*100+0.5))).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
@@ -697,7 +694,11 @@ func (d *desktop) recordView(c *ui.Context) {
 			})
 			ui.Column(c).Grow(1).MinWidth(220).Padding(10, 14).Gap(8).Radius(t.Radius).Border(1, t.Border).Children(func() {
 				ui.Row(c).AlignItems(ui.Center).Children(func() {
-					components.Icon(c, lucide.Volume2()).Size(13, 13)
+					sys := components.Checkbox(c.Key("capture-system"), &system, "").Label(d.tr(c, "systemAudio")).Disabled(d.busy || s.State != app.Idle && s.State != app.Paused || system && !microphone)
+					if sys.Changed() {
+						d.setCaptureInputs(microphone, system)
+					}
+					components.Icon(c, lucide.Volume2()).Size(13, 13).MarginStart(10)
 					components.Text(c, d.tr(c, "systemAudio")).FontSize(12).FontWeight(600).MarginStart(6)
 					ui.Spacer(c)
 					components.Text(c, fmt.Sprintf("%d%%", int(s.SystemLevel*100+0.5))).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
@@ -1083,7 +1084,17 @@ func (d *desktop) ready() {
 	var err error
 	d.trayMenu = d.menu()
 	d.syncTrayMenu()
-	d.tray, err = mygo.NewTray(mygo.TrayOptions{Icon: trayIcon(), IconIsTemplate: true, ToolTip: locales.Tf("tipPrefix", map[string]any{"state": locales.T("state.Ready")}), Menu: d.trayMenu})
+	if runtime.GOOS == "darwin" {
+		dockIcon, iconErr := branding.Icon(appIcon)
+		if iconErr != nil {
+			slog.Error("prepare dock icon", "error", iconErr)
+			dockIcon = appIcon
+		}
+		if err := mygo.App.Dock.SetIcon(dockIcon); err != nil {
+			slog.Error("set Dock icon", "error", err)
+		}
+	}
+	d.tray, err = mygo.NewTray(mygo.TrayOptions{Icon: trayIcon(), ToolTip: locales.Tf("tipPrefix", map[string]any{"state": locales.T("state.Ready")}), Menu: d.trayMenu})
 	if err != nil {
 		d.message = locales.T("menuBarUnavailable") + " " + err.Error()
 	}
@@ -1157,17 +1168,25 @@ func (d *desktop) ready() {
 		d.cancel()
 	})
 }
+
+//go:embed resources/icon.png
+var appIcon []byte
+
 func trayIcon() []byte {
-	img := image.NewNRGBA(image.Rect(0, 0, 24, 24))
-	for y := 3; y < 21; y++ {
-		for x := 4; x < 20; x++ {
-			if x < 7 || x > 16 || y < 6 || y > 17 {
-				img.SetNRGBA(x, y, color.NRGBA{A: 255})
-			}
-		}
+	icon, err := branding.Icon(appIcon)
+	if err != nil {
+		return appIcon
 	}
+	src, err := png.Decode(bytes.NewReader(icon))
+	if err != nil {
+		return appIcon
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, 32, 32))
+	xdraw.ApproxBiLinear.Scale(img, img.Bounds(), src, src.Bounds(), draw.Over, nil)
 	var b bytes.Buffer
-	_ = png.Encode(&b, img)
+	if err := png.Encode(&b, img); err != nil {
+		return appIcon
+	}
 	return b.Bytes()
 }
 
