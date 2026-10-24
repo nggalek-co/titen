@@ -1075,6 +1075,11 @@ func (d *desktop) ready() {
 		ContentTitle: d.titlebar,
 	})
 	d.win = d.shell.Window()
+	if runtime.GOOS == "windows" {
+		if err := d.win.SetIcon(appIcon); err != nil {
+			slog.Error("set window icon", "error", err)
+		}
+	}
 	d.win.OnClose(func(e *mygo.CloseEvent) {
 		if !d.quitting {
 			e.PreventDefault()

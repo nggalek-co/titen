@@ -3,7 +3,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
-if (-not $IsWindows) { throw 'Windows is required to build the WASAPI helper' }
+if ($env:OS -ne 'Windows_NT') { throw 'Windows is required to build the WASAPI helper' }
 if (-not $Version) { $Version = 'dev' }
 if ($Version -notmatch '^[A-Za-z0-9._+\-]+$') { throw 'Invalid version' }
 if ($Version -match '^v' -and -not $env:MYGO_UPDATER_PRIVATE_KEY) { throw 'Tagged Windows builds require MYGO_UPDATER_PRIVATE_KEY to sign automatic updates' }
@@ -46,7 +46,8 @@ try {
     Get-ChildItem dist -File -Filter 'Titen-*-windows-amd64.zip' | Remove-Item -Force
     Get-ChildItem dist -File -Filter 'Titen-*-windows-amd64.zip.sha256' | Remove-Item -Force
     $archive = "Titen-$Version-windows-amd64.zip"
-    Compress-Archive -Path $package -DestinationPath "dist/$archive" -Force
+    & tar.exe -a -c -f "dist/$archive" -C 'build/windows' 'Titen'
+    if ($LASTEXITCODE -ne 0) { throw 'Portable archive creation failed' }
     $hash = (Get-FileHash "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
     [System.IO.File]::WriteAllText((Join-Path $root "dist/$archive.sha256"), "$hash  $archive`n")
     $installers = @(Get-ChildItem 'dist/windows-amd64' -File -Filter "Titen Setup $mygoVersion amd64.exe")
