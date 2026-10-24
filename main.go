@@ -1173,7 +1173,11 @@ func (d *desktop) ready() {
 var appIcon []byte
 
 func trayIcon() []byte {
-	src, err := png.Decode(bytes.NewReader(appIcon))
+	icon, err := branding.Icon(appIcon)
+	if err != nil {
+		return appIcon
+	}
+	src, err := png.Decode(bytes.NewReader(icon))
 	if err != nil {
 		return appIcon
 	}
