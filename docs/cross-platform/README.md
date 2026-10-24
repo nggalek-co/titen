@@ -26,7 +26,7 @@ The workflow in .github/workflows/desktop.yml uses native macos-15 ARM64, macos-
 
 Windows Credential Manager is implemented without Cgo. macOS retains its existing native Security framework bridge and therefore builds with Cgo. Modernc removes the former system SQLite linker dependency on both platforms.
 
-Tag pushes matching v* build the tagged commit. Pull requests and manual dispatch exercise the same jobs with the development version. Tagged macOS builds require the persistent self-signed PKCS#12 certificate and password in repository secrets; the workflow validates and imports the certificate into a temporary keychain before packaging. Other macOS runs create an ephemeral self-signed identity. Actions have pinned revisions, read-only repository permissions, and no provider or payment credentials. No automatic release tag creation or public Release publication occurs.
+Tag pushes matching v* build the tagged commit and publish a GitHub Release after all platform checks pass. Pull requests and manual dispatch exercise the same jobs with the development version. Tagged macOS builds use the persistent self-signed PKCS#12 certificate and password from repository secrets; other macOS runs create an ephemeral self-signed identity. Tagged Windows builds use the persistent MyGo update key from a repository secret. Actions have pinned revisions, read-only permissions except for the release publisher, and no provider or payment credentials.
 
 Artifacts are platform-specific ZIP files and matching SHA256 files. cmd/packagecheck validates archive contents, Mach-O or PE CPU type, executable permissions for macOS, and the recorded checksum. This verifies the packaged files, not merely the staging directory.
 
