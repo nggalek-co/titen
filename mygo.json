@@ -1,0 +1,11 @@
+{
+  "name": "Titen",
+  "identifier": "co.nggalek.titen",
+  "version": "0.0.0",
+  "icon": "resources/icon.png",
+  "updates": {
+    "publicKey": "FNsABKITsfKmP/U7iS86nHkGP1+wgvhYzFnmu15l1X0=",
+    "github": "nggalek-co/titen",
+    "deltas": 0
+  }
+}

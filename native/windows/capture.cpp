@@ -25,11 +25,12 @@ void report(const std::string& message) {
     std::lock_guard<std::mutex> lock(log_mutex);
     std::cerr << message << std::endl;
 }
-void check(HRESULT hr, const char* operation) {
+void check(HRESULT hr, const char* operation, uint8_t source = 0) {
     if (SUCCEEDED(hr)) return;
     std::ostringstream text;
     text << operation << " failed (0x" << std::hex << static_cast<uint32_t>(hr) << "). ";
-    if (hr == E_ACCESSDENIED) text << "Enable desktop microphone access in Windows Settings > Privacy & security > Microphone.";
+    if (hr == E_ACCESSDENIED && source == 1) text << "Enable microphone access for desktop apps in Windows Settings > Privacy & security > Microphone.";
+    else if (hr == E_ACCESSDENIED) text << "Windows denied access to the audio endpoint.";
     else if (hr == AUDCLNT_E_DEVICE_INVALIDATED) text << "The audio device changed or disconnected. Select an available device and start recording again.";
     else text << "Check that an enabled audio device is connected and no exclusive-mode app owns it.";
     throw std::runtime_error(text.str());
@@ -40,6 +41,10 @@ struct Apartment {
 };
 struct MixFormat { WAVEFORMATEX* value = nullptr; ~MixFormat() { CoTaskMemFree(value); } };
 struct StartedClient { IAudioClient* value; ~StartedClient() { value->Stop(); } };
+struct CaptureEvent {
+    HANDLE value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    ~CaptureEvent() { if (value) CloseHandle(value); }
+};
 struct Writer {
     std::mutex mutex;
     std::condition_variable changed;
@@ -125,7 +130,9 @@ void capture(uint8_t source, std::wstring microphone, Writer& writer) {
         check(device->GetId(&device_id), "Read capture device identifier");
         const std::wstring active_id(device_id); CoTaskMemFree(device_id);
         ComPtr<IAudioClient> client;
-        check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(client.GetAddressOf())), "Activate audio capture");
+        check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(client.GetAddressOf())), "Activate audio capture", source);
+        CaptureEvent ready;
+        if (!ready.value) throw std::runtime_error("Create audio capture event failed");
         MixFormat mix; check(client->GetMixFormat(&mix.value), "Read audio format");
         auto* wave = mix.value;
         bool floating = wave->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
@@ -141,13 +148,17 @@ void capture(uint8_t source, std::wstring microphone, Writer& writer) {
             wave->nBlockAlign != format.channels * (format.bits / 8))
             throw std::runtime_error("Windows device format requires 8-192 kHz, 1-8 channel PCM");
         const uint8_t zero[8]{}; (void)titen::sample(zero, format);
-        DWORD options = source == 2 ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
-        check(client->Initialize(AUDCLNT_SHAREMODE_SHARED, options, 1000000, 0, wave, nullptr), "Initialize shared audio capture");
+        DWORD options = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        if (source == 2) options |= AUDCLNT_STREAMFLAGS_LOOPBACK;
+        check(client->Initialize(AUDCLNT_SHAREMODE_SHARED, options, 0, 0, wave, nullptr), "Initialize shared audio capture", source);
+        check(client->SetEventHandle(ready.value), "Set audio capture event", source);
         ComPtr<IAudioCaptureClient> input;
-        check(client->GetService(IID_PPV_ARGS(input.GetAddressOf())), "Open capture buffer");
-        check(client->Start(), "Start audio capture"); StartedClient started{client.Get()};
+        check(client->GetService(IID_PPV_ARGS(input.GetAddressOf())), "Open capture buffer", source);
+        check(client->Start(), "Start audio capture", source); StartedClient started{client.Get()};
         ULONGLONG next_device_check = GetTickCount64() + 1000;
         while (!stopped) {
+            const DWORD wait = WaitForSingleObject(ready.value, 1000);
+            if (wait == WAIT_FAILED) check(HRESULT_FROM_WIN32(GetLastError()), "Wait for audio capture event", source);
             if ((source == 2 || microphone.empty()) && GetTickCount64() >= next_device_check) {
                 ComPtr<IMMDevice> current;
                 check(devices->GetDefaultAudioEndpoint(source == 1 ? eCapture : eRender, eConsole, current.GetAddressOf()), "Check default audio device");
@@ -157,8 +168,9 @@ void capture(uint8_t source, std::wstring microphone, Writer& writer) {
                 if (changed) throw std::runtime_error("Default audio device changed. Start recording again to use the new device.");
                 next_device_check = GetTickCount64() + 1000;
             }
+            if (stopped || wait != WAIT_OBJECT_0) continue;
             UINT32 available = 0; check(input->GetNextPacketSize(&available), "Poll audio device");
-            if (!available) { Sleep(5); continue; }
+            if (!available) continue;
             while (available && !stopped) {
                 BYTE* data = nullptr; UINT32 frames = 0; DWORD flags = 0; UINT64 position = 0, qpc = 0;
                 check(input->GetBuffer(&data, &frames, &flags, &position, &qpc), "Read audio device");

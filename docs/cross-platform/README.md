@@ -12,7 +12,7 @@ This change ports the existing recorder to macOS and Windows. The web UI and Saa
 | Windows capture | C++ WASAPI microphone and default render-endpoint loopback, with shared monotonic QPC timestamps. |
 | Credentials | Native macOS Security framework and Windows Credential Manager. |
 | Native capture IPC | TIT1 signed PCM16 frames over binary stdout; stdin newline or EOF requests stop. |
-| Packaging | Native macOS app bundle and Windows directory package, each containing its capture helper. |
+| Packaging | Native macOS app bundle and Windows per-user MyGo installer plus portable ZIP, each containing its capture helper. |
 
 The temporary audio spool uses POSIX unlink on macOS and an exclusively opened delete-on-close handle on Windows. Both paths remove temporary audio when the process releases its handle.
 
@@ -22,7 +22,7 @@ The portable Go helper test fixture replaces shell scripts. Windows runs capture
 
 ## Build workflow
 
-The workflow in .github/workflows/desktop.yml uses native macos-15 ARM64, macos-15-intel AMD64, and windows-2025 AMD64 runners. It verifies architecture, tests, vets, builds, checks packaged binary formats and checksums, then uploads archives. On macOS the race suite runs. Windows tests and application compilation run with CGO_ENABLED=0. The Windows native helper is compiled with MSVC and its hardware-free self-test runs through CTest.
+The workflow in .github/workflows/desktop.yml uses native macos-15 ARM64, macos-15-intel AMD64, and windows-2025 AMD64 runners. It verifies architecture, tests, vets, builds, checks packaged binary formats and checksums, then uploads artifacts. On macOS the race suite runs. Windows tests and application compilation run with CGO_ENABLED=0. The Windows native helper is compiled with MSVC and its hardware-free self-test runs through CTest. Windows CI also installs two consecutive per-user packages and verifies the release version changes while the existing settings file survives. Pushed version tags publish a GitHub Release with platform packages and the signed MyGo update archive.
 
 Windows Credential Manager is implemented without Cgo. macOS retains its existing native Security framework bridge and therefore builds with Cgo. Modernc removes the former system SQLite linker dependency on both platforms.
 
@@ -42,7 +42,7 @@ Hosted CI does not prove physical capture. Validate simultaneous microphone and 
 
 Linux and Windows ARM64 capture are future work. Windows 10 x64 is the intended minimum, but native CI currently runs on Windows Server 2025. Real Windows 10/11 compatibility needs device testing. macOS 15 is the deployment minimum; CI uses macOS 15 hosts.
 
-Windows packages are unsigned. macOS packages are self-signed and not notarized Developer ID distribution. Gatekeeper can show an unidentified developer warning on first launch. See the root README for the one-time signing certificate and GitHub Secrets setup.
+Windows executables and installers have no Authenticode signature. MyGo updates use a separate persistent Ed25519 key, which authenticates update archives but does not establish a Windows publisher identity or suppress SmartScreen. The installer is per-user and does not touch `%APPDATA%\Titen`. See the root README for microphone privacy settings and the update secret. macOS packages are self-signed and not notarized Developer ID distribution. Gatekeeper can show an unidentified developer warning on first launch. See the root README for the one-time signing certificate and GitHub Secrets setup.
 
 ## References
 

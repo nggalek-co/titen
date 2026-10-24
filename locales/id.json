@@ -86,6 +86,7 @@
   "testMic": "Tes mikrofon 10 detik",
   "stopMicTest": "Hentikan tes mikrofon",
   "micTestNote": "Tes ini tetap di perangkat. Tidak menghubungi server Titen.",
+  "micPrivacySettings": "Pengaturan privasi mikrofon",
   "audioSources": "Sumber audio",
   "helperExe": "Eksekutabel helper audio",
   "headphonesNote": "Pakai headphone untuk mengurangi ucapan ganda dari gema mikrofon. Jeda sebelum mengubah pengaturan rekaman.",

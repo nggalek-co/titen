@@ -62,6 +62,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go run github.com/egoist/mygo/cmd/mygo vet .
           exit $LASTEXITCODE
+      - name: Verify consecutive Windows installer upgrades
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CGO_ENABLED: '0'
+        run: ./scripts/verify-windows-upgrade.ps1
       - name: Create temporary signing keychain for macOS builds
         if: runner.os == 'macOS'
         shell: bash
@@ -108,7 +114,8 @@ jobs:
           fi
           security import "$p12" -k "$keychain" -P "$TITEN_SIGNING_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$TITEN_CODESIGN_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
-          security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$certificate" >/dev/null
+          sudo -n security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$certificate" >/dev/null
           identities="$(security find-identity -v -p codesigning "$keychain")"
           if ! printf '%s\n' "$identities" | grep -Fq "\"$TITEN_CODESIGN_IDENTITY\""; then
             echo "::error::The signing certificate identity must be \"$TITEN_CODESIGN_IDENTITY\"."
@@ -120,10 +127,13 @@ jobs:
         shell: bash
         env:
           TITEN_SIGNING_EPHEMERAL: ${{ github.ref_type != 'tag' && '1' || '0' }}
+          TITEN_CODESIGN_CI: '1'
         run: sh scripts/build-macos.sh
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          MYGO_UPDATER_PRIVATE_KEY: ${{ github.ref_type == 'tag' && secrets.MYGO_UPDATER_PRIVATE_KEY || '' }}
         run: ./scripts/build-windows.ps1
       - name: Validate packaged binaries
         shell: bash
@@ -137,6 +147,10 @@ jobs:
           path: |
             dist/*.zip
             dist/*.sha256
+            dist/windows-amd64/Titen Setup *.exe
+            dist/windows-amd64/Titen Setup *.exe.sha256
+            dist/windows-amd64/*.tar.gz
+            dist/windows-amd64/update-*.json
           if-no-files-found: error
           retention-days: 30
       - name: Remove temporary signing keychain
@@ -145,3 +159,37 @@ jobs:
         run: |
           security delete-keychain "$RUNNER_TEMP/titen-signing.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/titen-signing.p12" "$RUNNER_TEMP/titen-signing-cert.pem"
+
+  publish-release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'Titen-*' --dir release-assets
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --draft --verify-tag --title "Titen $GITHUB_REF_NAME" --generate-notes
+          fi
+      - name: Upload installers and archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -d '' assets < <(find release-assets -type f -print0)
+          if ((${#assets[@]} == 0)); then
+            echo 'No release assets were downloaded' >&2
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

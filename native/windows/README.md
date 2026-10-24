@@ -1,6 +1,6 @@
 # Windows audio helper
 
-`titen-audio.exe` captures the selected microphone and the default playback device through WASAPI shared mode. Each source has its own capture thread and COM apartment. A bounded queue sends complete TIT1 packets through one stdout writer.
+`titen-audio.exe` captures the selected microphone and the default playback device through WASAPI shared mode. It requests event-driven buffers for microphone capture and render-endpoint loopback, then drains each ready packet on its own capture thread and COM apartment. A bounded queue sends complete TIT1 packets through one stdout writer.
 
 Build with Visual Studio 2022 C++ tools and the Windows SDK.
 
@@ -21,7 +21,7 @@ The executable is `build/windows-audio/Release/titen-audio.exe`.
 - `--list-devices` prints a JSON array with `id` and `name` fields.
 - `--self-test` checks conversion and the TIT1 wire format without audio hardware.
 
-The parent keeps stdin open while recording. A newline or EOF stops both sources. The helper also handles console termination. Diagnostics use stderr. Device invalidation, default-device changes, and capture errors stop both sources and return a nonzero exit code.
+The parent keeps stdin open while recording. A newline or EOF stops both sources. The helper also handles console termination. Diagnostics use stderr. Device invalidation, default-device changes, and capture errors stop both sources and return a nonzero exit code. When Windows denies microphone capture, the error points to the desktop-app microphone toggle in Privacy settings.
 
 ## Audio contract
 

@@ -29,7 +29,13 @@ Windows 10 and later on x64 are the initial Windows target. Build with Go 1.27.1
 ./scripts/build-windows.ps1
 ```
 
-Run `build/windows/Titen/Titen.exe`. Keep `titen-audio.exe` beside it. The package uses WASAPI microphone and playback loopback capture and Windows Credential Manager. No WebView2, external SQLite DLL, or virtual audio driver is required by this build.
+The build produces a portable ZIP and a per-user installer in `dist/windows-amd64`. The portable app is staged at `build/windows/Titen`; keep `Titen.exe` and `titen-audio.exe` together. The installer uses MyGo's stable app identity and installs under `%LOCALAPPDATA%\Programs\Titen`; it does not need administrator access. Settings, credentials, logs, and transcripts stay under `%APPDATA%\Titen` across upgrades.
+
+Windows capture uses shared-mode WASAPI event notifications for microphone input and playback loopback. If Windows denies microphone access, open **Settings → Privacy & security → Microphone**, enable microphone access and **Let desktop apps access your microphone**, then retry. Titen's microphone settings button opens that page. Loopback reads the selected playback endpoint and has no separate microphone permission prompt.
+
+The MyGo native updater checks for releases in the background and offers updates from Titen's tray menu. Update archives are signed with a persistent Ed25519 key whose public half is in `mygo.json`; this provides update authenticity without a paid code-signing certificate. The Windows installer and app executables remain unsigned. SmartScreen can warn on each new installer, and Smart App Control or organization policy may block unsigned apps. Download only from the official Titen GitHub release and verify its SHA256 before deciding whether to continue. The MyGo update signature does not remove Windows' unsigned-app warning.
+
+The CI upgrade check installs versions 0.0.1 and 0.0.2 in sequence and verifies that the app version changes while `%APPDATA%\Titen\settings.json` remains byte-for-byte intact.
 
 The native helper has a hardware-free protocol and conversion test.
 
@@ -41,17 +47,17 @@ The first supported release targets macOS ARM64, macOS Intel, and Windows AMD64.
 
 ## GitHub builds on version tags
 
-The Desktop builds workflow runs native tests and creates archives on pull requests, pushes to main, manual dispatch, and pushed tags matching `v*`. For example, pushing `v1.2.3` builds that exact tagged source.
+The Desktop builds workflow runs native checks and packages pull requests, pushes to main, manual dispatches, and tags matching `v*`. A successful tag run also publishes a GitHub Release. For example, pushing `v1.2.3` builds that exact tagged source.
 
-Each successful run uploads three downloadable GitHub Actions artifacts. Each artifact contains its platform ZIP and SHA256 checksum.
+Each successful run uploads three downloadable GitHub Actions artifacts. The Windows artifact also contains the per-user installer and, for tagged builds, MyGo's signed updater manifest and archive. A tag run publishes these assets alongside the platform ZIPs and checksums.
 
 - `Titen-macos-arm64` contains the Apple silicon app and Swift helper.
 - `Titen-macos-amd64` contains the Intel app and Swift helper.
 - `Titen-windows-amd64` contains the Windows application and WASAPI helper.
 
-Download them from the workflow run's Artifacts section. Version tags set the embedded application version and archive filenames. The workflow does not create tags or publish GitHub Releases. A failed platform build fails its job and produces no successful package for that platform.
+Download CI artifacts from the workflow run's Artifacts section. Version tags set the embedded application version and archive filenames. A failed platform build blocks publication of the release.
 
-macOS packages on branches, pull requests, and manual runs use an ephemeral self-signed identity for build validation. Tagged macOS builds require the shared signing certificate secrets described below; the job fails if either secret is missing, so a tag cannot silently produce an ad hoc package. Windows packages are unsigned. The self-signed macOS packages are not notarized, so Gatekeeper can still warn on first launch.
+macOS packages on branches, pull requests, and manual runs use an ephemeral self-signed identity for build validation. Tagged macOS builds require the shared signing certificate secrets described below. Tagged Windows builds require the persistent MyGo update key. Windows executables and installers are unsigned, and MyGo's update signing does not act as Windows code signing. The self-signed macOS packages are not notarized, so Gatekeeper can still warn on first launch.
 
 ### Persistent macOS signing in GitHub Actions
 
@@ -63,6 +69,16 @@ signing_dir="$HOME/Library/Application Support/Titen/Signing"
 base64 < "$signing_dir/titen-self-signed.p12" | tr -d '\n' | gh secret set TITEN_SIGNING_CERTIFICATE
 swift scripts/keychain-password.swift get co.nggalek.titen.codesign.p12 'Titen Self-Signed Code Signing' | gh secret set TITEN_SIGNING_CERTIFICATE_PASSWORD
 ```
+
+### Persistent Windows update key
+
+MyGo's Ed25519 update key is separate from Windows Authenticode signing. The private key must stay outside the repository and remain backed up; installed Titen builds only accept updates signed by that key. The release workflow reads it from the `MYGO_UPDATER_PRIVATE_KEY` repository secret:
+
+```sh
+gh secret set MYGO_UPDATER_PRIVATE_KEY < path/to/mygo-update.key
+```
+
+Use the existing key that matches `updates.publicKey` in [mygo.json](mygo.json). Do not generate a replacement for routine releases. Local Windows builds need no secret; local builds that should emit signed update assets can set `MYGO_UPDATER_PRIVATE_KEY` from the same private key file.
 
 The private key stays in the PKCS#12 file and local Keychain. The passphrase is stored in the macOS login Keychain instead of a plaintext file. The two GitHub repository secrets are encrypted by GitHub and available to Actions; Base64 only encodes the PKCS#12 for transport. Keep both secrets unchanged for every release. No paid Apple Developer account is used. The version-tag workflow imports the identity into a temporary keychain, signs both executables and the app, validates the designated requirements and entitlements, and removes the temporary keychain after packaging.
 

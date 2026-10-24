@@ -86,6 +86,7 @@
   "testMic": "Test microphone for 10 seconds",
   "stopMicTest": "Stop microphone test",
   "micTestNote": "This test stays on your device. It does not contact the Titen server.",
+  "micPrivacySettings": "Microphone privacy settings",
   "audioSources": "Audio sources",
   "helperExe": "Audio helper executable",
   "headphonesNote": "Use headphones to reduce duplicate speech from microphone echo. Pause before changing capture settings.",
