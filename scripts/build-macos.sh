@@ -2,8 +2,12 @@
 set -eu
 cd "$(dirname "$0")/.."
 [ "$(uname -s)" = Darwin ] || { echo "macOS is required" >&2; exit 1; }
+. scripts/signing-config.sh
 version="${TITEN_VERSION:-dev}"
 case "$version" in ""|*[!A-Za-z0-9._+-]*) echo "Invalid version" >&2; exit 1;; esac
+sh scripts/sign-cert.sh
+signing_identity="$TITEN_CODESIGN_IDENTITY"
+signing_keychain="${TITEN_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 bundle_version=$(printf '%s' "$version" | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p')
 bundle_version="${bundle_version:-0.0.0}"
 export MACOSX_DEPLOYMENT_TARGET=15.0
@@ -23,7 +27,7 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 <plist version="1.0"><dict>
 <key>CFBundleName</key><string>Titen</string>
 <key>CFBundleDisplayName</key><string>Titen</string>
-<key>CFBundleIdentifier</key><string>co.nggalek.titen</string>
+<key>CFBundleIdentifier</key><string>$TITEN_APP_BUNDLE_ID</string>
 <key>CFBundleExecutable</key><string>titen</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$bundle_version</string>
@@ -35,13 +39,53 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 plutil -lint "$bundle/Contents/Info.plist"
-signing_identity="${TITEN_CODESIGN_IDENTITY:--}"
-if [ "$signing_identity" = - ]; then
-  echo "Using ad hoc signing. macOS permissions may require approval again after rebuilding." >&2
-fi
-codesign --force --sign "$signing_identity" --identifier co.nggalek.titen.audio "$bundle/Contents/MacOS/titen-audio"
-codesign --force --sign "$signing_identity" "$bundle"
+plutil -lint "$TITEN_ENTITLEMENTS"
+codesign --force --timestamp=none --sign "$signing_identity" --keychain "$signing_keychain" \
+  --identifier "$TITEN_AUDIO_BUNDLE_ID" \
+  --requirements "=$TITEN_AUDIO_DESIGNATED_REQUIREMENT" \
+  --entitlements "$TITEN_ENTITLEMENTS" "$bundle/Contents/MacOS/titen-audio"
+codesign --force --timestamp=none --sign "$signing_identity" --keychain "$signing_keychain" \
+  --identifier "$TITEN_APP_BUNDLE_ID" \
+  --requirements "=$TITEN_APP_DESIGNATED_REQUIREMENT" \
+  --entitlements "$TITEN_ENTITLEMENTS" "$bundle"
+codesign --verify --strict "$bundle/Contents/MacOS/titen-audio"
 codesign --verify --deep --strict "$bundle"
+verify_signed_target() {
+  path="$1"
+  expected_id="$2"
+  details=$(codesign -d --verbose=4 "$path" 2>&1)
+  actual_id=$(printf '%s\n' "$details" | sed -n 's/^Identifier=//p' | head -n 1)
+  authority=$(printf '%s\n' "$details" | sed -n 's/^Authority=//p' | head -n 1)
+  [ "$actual_id" = "$expected_id" ] || { echo "Unexpected code identifier for $path: $actual_id" >&2; exit 1; }
+  [ "$authority" = "$signing_identity" ] || { echo "Unexpected code signer for $path: $authority" >&2; exit 1; }
+  actual_requirement=$(codesign -d -r- "$path" 2>&1 | sed -n '/^designated =>/p')
+  case "$actual_requirement" in
+    *"identifier \"$expected_id\""*"certificate leaf[subject.CN] = \"$signing_identity\""*) ;;
+    *) echo "Unexpected designated requirement for $path: $actual_requirement" >&2; exit 1;;
+  esac
+  entitlements_dump=$(mktemp)
+  if ! codesign -d --entitlements :- "$path" > "$entitlements_dump" 2>/dev/null; then
+    rm -f "$entitlements_dump"
+    echo "Could not read signed entitlements for $path" >&2
+    exit 1
+  fi
+  if [ -s "$entitlements_dump" ]; then
+    actual_entitlements=$(plutil -convert json -o - "$entitlements_dump") || {
+      rm -f "$entitlements_dump"
+      echo "Could not parse signed entitlements for $path" >&2
+      exit 1
+    }
+  else
+    actual_entitlements='{}'
+  fi
+  rm -f "$entitlements_dump"
+  expected_entitlements=$(plutil -convert json -o - "$TITEN_ENTITLEMENTS")
+  [ "$actual_entitlements" = "$expected_entitlements" ] || { echo "Unexpected signed entitlements for $path: $actual_entitlements" >&2; exit 1; }
+}
+verify_signed_target "$bundle/Contents/MacOS/titen-audio" "$TITEN_AUDIO_BUNDLE_ID"
+verify_signed_target "$bundle" "$TITEN_APP_BUNDLE_ID"
+app_identifier=$(plutil -extract CFBundleIdentifier raw -o - "$bundle/Contents/Info.plist")
+[ "$app_identifier" = "$TITEN_APP_BUNDLE_ID" ] || { echo "Unexpected app bundle identifier: $app_identifier" >&2; exit 1; }
 echo "Built $bundle"
 
 arch=$(go env GOARCH)

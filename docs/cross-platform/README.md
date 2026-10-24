@@ -26,7 +26,7 @@ The workflow in .github/workflows/desktop.yml uses native macos-15 ARM64, macos-
 
 Windows Credential Manager is implemented without Cgo. macOS retains its existing native Security framework bridge and therefore builds with Cgo. Modernc removes the former system SQLite linker dependency on both platforms.
 
-Tag pushes matching v* build the tagged commit. Pull requests and manual dispatch exercise the same jobs with the development version. Actions have pinned revisions, read-only repository permissions, and no provider or payment credentials. No automatic release tag creation or public Release publication occurs.
+Tag pushes matching v* build the tagged commit. Pull requests and manual dispatch exercise the same jobs with the development version. Tagged macOS builds require the persistent self-signed PKCS#12 certificate and password in repository secrets; the workflow validates and imports the certificate into a temporary keychain before packaging. Other macOS runs create an ephemeral self-signed identity. Actions have pinned revisions, read-only repository permissions, and no provider or payment credentials. No automatic release tag creation or public Release publication occurs.
 
 Artifacts are platform-specific ZIP files and matching SHA256 files. cmd/packagecheck validates archive contents, Mach-O or PE CPU type, executable permissions for macOS, and the recorded checksum. This verifies the packaged files, not merely the staging directory.
 
@@ -42,7 +42,7 @@ Hosted CI does not prove physical capture. Validate simultaneous microphone and 
 
 Linux and Windows ARM64 capture are future work. Windows 10 x64 is the intended minimum, but native CI currently runs on Windows Server 2025. Real Windows 10/11 compatibility needs device testing. macOS 15 is the deployment minimum; CI uses macOS 15 hosts.
 
-Windows packages are unsigned. macOS packages use ad hoc signatures, not notarized Developer ID distribution. Release trust configuration is separate from build automation.
+Windows packages are unsigned. macOS packages are self-signed and not notarized Developer ID distribution. Gatekeeper can show an unidentified developer warning on first launch. See the root README for the one-time signing certificate and GitHub Secrets setup.
 
 ## References
 
