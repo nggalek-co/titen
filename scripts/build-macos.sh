@@ -22,7 +22,11 @@ mkdir -p "$GOCACHE" "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULECACHE_PATH"
 swift build --disable-sandbox --package-path native/macos -c release
 bundle="build/Titen.app"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-go build -trimpath -ldflags "-s -w -X main.version=$version" -o "$bundle/Contents/MacOS/titen" .
+production_ldflag=
+case "$version" in
+	v[0-9]*.[0-9]*.[0-9]*|[0-9]*.[0-9]*.[0-9]*) production_ldflag=' -X github.com/egoist/mygo.production=1' ;;
+esac
+go build -trimpath -ldflags "-s -w -X main.version=$version$production_ldflag" -o "$bundle/Contents/MacOS/titen" .
 cp native/macos/.build/release/titen-audio "$bundle/Contents/MacOS/titen-audio"
 cp resources/icon.png "$bundle/Contents/Resources/icon.png"
 cat > "$bundle/Contents/Info.plist" <<PLIST

@@ -9,7 +9,7 @@
 
 ## Done predicate
 
-The desktop defaults to http://localhost:3000, saves a configurable server origin, pairs through the web device authorization flow, stores an origin-scoped token in the OS credential store, and sends audio through the managed transcription session. Local finalized transcripts survive. No provider credentials are requested. Tests exercise HTTP pairing and WebSocket audio/finalization. Run the real local worker integration without recording ambient audio.
+Production builds default to https://titen.nggalek.co; development builds use http://localhost:3000. The desktop saves a configurable server origin, pairs through the web device authorization flow, stores an origin-scoped token in the OS credential store, and sends audio through the managed transcription session. Local finalized transcripts survive. No provider credentials are requested. Tests exercise HTTP pairing and WebSocket audio/finalization. Run the real local worker integration without recording ambient audio.
 
 ## Design and throughput checkpoint
 

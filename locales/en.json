@@ -73,7 +73,7 @@
   "accountTitle": "Titen account",
   "accountDesc": "The server manages transcription and credit. Connect Google from your web account.",
   "serverEndpoint": "Server endpoint",
-  "endpointHint": "Local development defaults to http://localhost:3000. Hosted servers require HTTPS.",
+  "endpointHint": "Production builds default to https://titen.nggalek.co. Local development uses http://localhost:3000. Hosted endpoints require HTTPS.",
   "signInBrowser": "Sign in with browser",
   "signedIn": "Signed in",
   "approveCode": "Approve code: {code}",

@@ -86,7 +86,7 @@ See [cross-platform architecture and verification](docs/cross-platform/README.md
 
 ## Connect the desktop to Titen
 
-Open **Settings** and set **Server endpoint**. Local development defaults to `http://localhost:3000`. Hosted endpoints must use HTTPS. Save settings, then click **Sign in with browser** and approve the displayed code. The desktop stores its device token in Keychain or Windows Credential Manager, scoped to that endpoint.
+Production builds default to `https://titen.nggalek.co`; local development defaults to `http://localhost:3000`. Open **Settings** to choose another server endpoint. Hosted endpoints must use HTTPS. Save settings, then click **Sign in with browser** and approve the displayed code. The desktop stores its device token in Keychain or Windows Credential Manager, scoped to that endpoint.
 
 Start a meeting as usual. Titen reserves account credit before capture, sends 16 kHz mono audio directly to Soniox, and saves finalized transcript segments locally. The backend retains the long-lived Soniox key and issues a single-use temporary key for each recording session. It reconciles charges from provider usage records. Unused reserved credit remains held until reconciliation. Open **Open billing** or **Google settings** in the browser to manage account credit and Google access.
 

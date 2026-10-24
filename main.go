@@ -286,6 +286,9 @@ func (d *desktop) save() {
 		return
 	}
 	cfg.ServerEndpoint = endpoint
+	if endpoint != d.settings.ServerEndpoint {
+		cfg.ServerEndpointCustom = true
+	}
 	old := d.settings.ServerEndpoint
 	d.async(func() error {
 		if err := d.service.ConfigureCapture(cfg); err != nil {
@@ -938,7 +941,7 @@ func (d *desktop) settingsView(c *ui.Context) {
 				ui.Divider(c)
 				ui.Column(c).Gap(5).Children(func() {
 					components.Text(c, d.tr(c, "serverEndpoint")).FontSize(12).FontWeight(600)
-					components.TextBox(c.Key("server-endpoint"), &d.endpointInput, components.TextBoxOptions{}).Placeholder("http://localhost:3000")
+					components.TextBox(c.Key("server-endpoint"), &d.endpointInput, components.TextBoxOptions{}).Placeholder(saas.ProductionEndpoint)
 					components.Text(c, d.tr(c, "endpointHint")).FontSize(11).TextColor(t.TextMuted)
 				})
 				ui.Row(c).Gap(10).AlignItems(ui.Center).Wrap().Children(func() {
@@ -1177,6 +1180,13 @@ func currentVersion() string {
 	return version
 }
 
+func defaultServerEndpoint() string {
+	if mygo.IsDev() {
+		return saas.DefaultEndpoint
+	}
+	return saas.ProductionEndpoint
+}
+
 func main() {
 	dir, err := os.UserConfigDir()
 	if err != nil {
@@ -1202,7 +1212,7 @@ func main() {
 			slog.Info("logging initialized", "path", logPath)
 		}
 	}
-	cfg, err := app.LoadSettings(dir)
+	cfg, err := app.LoadSettingsWithDefaultEndpoint(dir, defaultServerEndpoint())
 	if err != nil {
 		slog.Error("settings", "error", err)
 		os.Exit(1)

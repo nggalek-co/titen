@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"titen/internal/saas"
 )
 
 func TestSettingsDefaultAndEndpointPersistence(t *testing.T) {
@@ -25,6 +26,31 @@ func TestSettingsDefaultAndEndpointPersistence(t *testing.T) {
 	}
 	if loaded.ServerEndpoint != "https://titen.example" {
 		t.Fatalf("loaded endpoint = %q", loaded.ServerEndpoint)
+	}
+}
+
+func TestProductionDefaultMigratesImplicitLocalhostAndPreservesCustomLocalhost(t *testing.T) {
+	dir := t.TempDir()
+	settings, err := LoadSettingsWithDefaultEndpoint(dir, saas.ProductionEndpoint)
+	if err != nil || settings.ServerEndpoint != saas.ProductionEndpoint {
+		t.Fatalf("production default = %+v, %v", settings, err)
+	}
+
+	path := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(path, []byte(`{"server_endpoint":"http://localhost:3000"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = LoadSettingsWithDefaultEndpoint(dir, saas.ProductionEndpoint)
+	if err != nil || settings.ServerEndpoint != saas.ProductionEndpoint {
+		t.Fatalf("legacy endpoint = %+v, %v", settings, err)
+	}
+
+	if err := os.WriteFile(path, []byte(`{"server_endpoint":"http://localhost:3000","server_endpoint_custom":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = LoadSettingsWithDefaultEndpoint(dir, saas.ProductionEndpoint)
+	if err != nil || settings.ServerEndpoint != saas.DefaultEndpoint {
+		t.Fatalf("custom endpoint = %+v, %v", settings, err)
 	}
 }
 

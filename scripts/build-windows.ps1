@@ -32,7 +32,9 @@ try {
     $configJson = $config | ConvertTo-Json -Depth 16
     [System.IO.File]::WriteAllText($configPath, $configJson + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 
-    $arguments = @('run', 'github.com/egoist/mygo/cmd/mygo', 'build', '-platform', 'windows/amd64', '-o', 'dist')
+    $arguments = @('run', 'github.com/egoist/mygo/cmd/mygo', 'build')
+    if ($Version -notmatch '^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { $arguments += '-debug' }
+    $arguments += @('-platform', 'windows/amd64', '-o', 'dist')
     & go @arguments
     if ($LASTEXITCODE -ne 0) { throw 'MyGo Windows packaging failed' }
 
