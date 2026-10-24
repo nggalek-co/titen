@@ -155,13 +155,17 @@ openssl pkcs12 -legacy -in "$certificate_path" -clcerts -nokeys -passin "pass:$c
 	exit 1
 }
 
+echo "Importing the signing identity into the selected keychain."
 security import "$certificate_path" -k "$keychain" -P "$certificate_password" -T /usr/bin/codesign >/dev/null
 if [ -n "${TITEN_CODESIGN_KEYCHAIN_PASSWORD:-}" ]; then
+	echo "Configuring codesign access to the selected keychain."
 	security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
 		-k "$TITEN_CODESIGN_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
 fi
+echo "Trusting the self-signed code-signing certificate in the selected keychain."
 security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$tmp_dir/cert.pem" >/dev/null
 
+echo "Checking that the signing identity is available to codesign."
 installed_fingerprints=$(identity_fingerprints)
 if ! printf '%s\n' "$installed_fingerprints" | grep -Fxiq "$expected_fingerprint"; then
 	echo "Imported certificate is not a valid code-signing identity in $keychain" >&2
