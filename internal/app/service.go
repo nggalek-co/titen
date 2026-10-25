@@ -364,11 +364,25 @@ func (s *Service) beginCapture(ctx context.Context) error {
 	s.mu.Unlock()
 	go func() {
 		defer close(done)
-		errorsDone := make(chan struct{})
+		diagnosticsDone := make(chan struct{})
 		go func() {
-			defer close(errorsDone)
-			for err := range cap.Errors {
-				s.fail(err)
+			defer close(diagnosticsDone)
+			diagnostics, warnings := cap.Errors, cap.Warnings
+			for diagnostics != nil || warnings != nil {
+				select {
+				case err, ok := <-diagnostics:
+					if !ok {
+						diagnostics = nil
+					} else if err != nil {
+						s.fail(err)
+					}
+				case warning, ok := <-warnings:
+					if !ok {
+						warnings = nil
+					} else if warning != nil {
+						slog.Warn("audio capture warning", "warning", warning)
+					}
+				}
 			}
 		}()
 		err := (audio.Pipeline{}).Run(ctx, cap.Frames, func(chunk audio.Chunk) error {
@@ -389,7 +403,7 @@ func (s *Service) beginCapture(ctx context.Context) error {
 		if err != nil && ctx.Err() == nil {
 			s.fail(err)
 		}
-		<-errorsDone
+		<-diagnosticsDone
 		go s.recoverCapture(ctx, cap, s.Snapshot().MeetingID)
 	}()
 	return nil

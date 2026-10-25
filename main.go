@@ -262,6 +262,11 @@ func (d *desktop) refreshDevices() {
 	helper := d.settings.HelperPath
 	d.async(func() error {
 		devices, err := audio.ListDevices(d.root, helper)
+		if err != nil {
+			slog.Warn("microphone discovery failed", "error", err)
+		} else {
+			slog.Info("microphones discovered", "count", len(devices))
+		}
 		d.win.Update(func() {
 			d.devices = devices
 			for _, device := range devices {
@@ -1108,6 +1113,7 @@ func (d *desktop) ready() {
 		d.message = locales.T("menuBarUnavailable") + " " + err.Error()
 	}
 	d.probe()
+	d.refreshDevices()
 	d.tasks.Add(1)
 	go func() {
 		defer d.tasks.Done()

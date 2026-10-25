@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,11 +20,12 @@ type Device struct {
 }
 type CaptureConfig struct{ HelperPath, MicrophoneID, Mode string }
 type Capture struct {
-	Frames <-chan Frame
-	Errors <-chan error
-	cancel context.CancelFunc
-	done   chan struct{}
-	once   sync.Once
+	Frames   <-chan Frame
+	Errors   <-chan error
+	Warnings <-chan error
+	cancel   context.CancelFunc
+	done     chan struct{}
+	once     sync.Once
 }
 
 func ListDevices(ctx context.Context, helperPath string) ([]Device, error) {
@@ -75,13 +77,20 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 		return nil, err
 	}
 	errs := make(chan error, 32)
+	warnings := make(chan error, 32)
 	report := func(err error) {
 		select {
 		case errs <- err:
 		default:
 		}
 	}
-	stderr := &limitedError{report: report}
+	warn := func(err error) {
+		select {
+		case warnings <- err:
+		default:
+		}
+	}
+	stderr := &limitedError{report: report, warn: warn}
 	cmd.Stderr = stderr
 	if err = cmd.Start(); err != nil {
 		slog.Error("audio helper start failed", "error", err)
@@ -89,12 +98,13 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 		return nil, fmt.Errorf("start native audio helper: %w", err)
 	}
 	frames := make(chan Frame, 32)
-	c := &Capture{Frames: frames, Errors: errs, cancel: cancel, done: make(chan struct{})}
+	c := &Capture{Frames: frames, Errors: errs, Warnings: warnings, cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(c.done)
 		defer stdin.Close()
 		defer close(frames)
 		defer close(errs)
+		defer close(warnings)
 		var readErr error
 		overflowReported := false
 		for {
@@ -124,6 +134,7 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 			}
 		}
 		waitErr := cmd.Wait()
+		stderr.flush()
 		if ctx.Err() == nil && waitErr != nil {
 			slog.Error("audio helper exited", "pid", cmd.Process.Pid, "error", waitErr, "stderr", stderr.String(), "read_error", readErr)
 		} else {
@@ -153,9 +164,12 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*Capture, error) {
 func (c *Capture) Close() error { c.once.Do(c.cancel); <-c.done; return nil }
 
 type limitedError struct {
-	mu     sync.Mutex
-	b      []byte
-	report func(error)
+	mu          sync.Mutex
+	b           []byte
+	pending     []byte
+	lastWarning string
+	report      func(error)
+	warn        func(error)
 }
 
 func (l *limitedError) Write(p []byte) (int, error) {
@@ -166,10 +180,63 @@ func (l *limitedError) Write(p []byte) (int, error) {
 		l.b = append(l.b, p[:min(left, n)]...)
 	}
 	if l.report != nil {
-		if message := strings.TrimSpace(string(p[:min(n, 4096)])); message != "" {
-			l.report(fmt.Errorf("audio helper: %s", message))
-		}
+		l.pending = append(l.pending, p...)
+		l.flushPending(false)
 	}
 	return n, nil
 }
+
+func (l *limitedError) flush() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.flushPending(true)
+}
+
+func (l *limitedError) flushPending(final bool) {
+	for {
+		lineEnd := bytes.IndexByte(l.pending, '\n')
+		if lineEnd >= 0 {
+			l.reportMessage(string(l.pending[:lineEnd]))
+			l.pending = l.pending[lineEnd+1:]
+			continue
+		}
+		if len(l.pending) == 0 || (!final && len(l.pending) <= 4096) {
+			return
+		}
+		limit := min(len(l.pending), 4096)
+		l.reportMessage(string(l.pending[:limit]))
+		l.pending = l.pending[limit:]
+		if final && len(l.pending) == 0 {
+			return
+		}
+	}
+}
+
+func (l *limitedError) reportMessage(message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	lower := strings.ToLower(message)
+	warningPrefix := strings.HasPrefix(lower, "warning:")
+	legacyWarning := strings.HasPrefix(lower, "audio device reported a capture discontinuity.") ||
+		strings.HasPrefix(lower, "audio output queue overflow.")
+	if warningPrefix || legacyWarning {
+		if warningPrefix {
+			message = strings.TrimSpace(message[len("warning:"):])
+		}
+		if message == l.lastWarning {
+			return
+		}
+		l.lastWarning = message
+		if l.warn != nil {
+			l.warn(fmt.Errorf("audio helper: %s", message))
+			return
+		}
+	}
+	if l.report != nil {
+		l.report(fmt.Errorf("audio helper: %s", message))
+	}
+}
+
 func (l *limitedError) String() string { l.mu.Lock(); defer l.mu.Unlock(); return string(l.b) }

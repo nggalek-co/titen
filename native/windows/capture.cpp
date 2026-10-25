@@ -25,6 +25,7 @@ void report(const std::string& message) {
     std::lock_guard<std::mutex> lock(log_mutex);
     std::cerr << message << std::endl;
 }
+void report_warning(const std::string& message) { report("Warning: " + message); }
 void check(HRESULT hr, const char* operation, uint8_t source = 0) {
     if (SUCCEEDED(hr)) return;
     std::ostringstream text;
@@ -54,7 +55,7 @@ struct Writer {
         std::lock_guard<std::mutex> lock(mutex);
         if (queue.size() >= 128) {
             queue.pop_front();
-            if (!warned) { report("Audio output queue overflow. Captured audio was dropped."); warned = true; }
+            if (!warned) { report_warning("Audio output queue overflow. Captured audio was dropped."); warned = true; }
         }
         queue.push_back(std::move(packet)); changed.notify_one();
     }
@@ -156,6 +157,7 @@ void capture(uint8_t source, std::wstring microphone, Writer& writer) {
         check(client->GetService(IID_PPV_ARGS(input.GetAddressOf())), "Open capture buffer", source);
         check(client->Start(), "Start audio capture", source); StartedClient started{client.Get()};
         ULONGLONG next_device_check = GetTickCount64() + 1000;
+        bool discontinuity_reported = false;
         while (!stopped) {
             const DWORD wait = WaitForSingleObject(ready.value, 1000);
             if (wait == WAIT_FAILED) check(HRESULT_FROM_WIN32(GetLastError()), "Wait for audio capture event", source);
@@ -179,7 +181,10 @@ void capture(uint8_t source, std::wstring microphone, Writer& writer) {
                         LARGE_INTEGER now, frequency; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
                         qpc = static_cast<uint64_t>((static_cast<long double>(now.QuadPart) * 10000000) / frequency.QuadPart);
                     }
-                    if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) report("Audio device reported a capture discontinuity. Some audio may be missing.");
+                    if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) && !discontinuity_reported) {
+                        report_warning("Audio device reported a capture discontinuity. Some audio may be missing.");
+                        discontinuity_reported = true;
+                    }
                     for (uint32_t offset = 0; offset < frames; offset += 4800) {
                         uint32_t size = std::min(uint32_t(4800), frames - offset);
                         const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;

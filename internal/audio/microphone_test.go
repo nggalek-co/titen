@@ -17,7 +17,9 @@ func microphoneFixture(t *testing.T, source byte, config testhelper.CaptureConfi
 }
 
 func TestMicrophoneUsesSelectedDeviceAndReportsLocalLevel(t *testing.T) {
-	cfg, helper := microphoneFixture(t, 1, testhelper.CaptureConfig{})
+	cfg, helper := microphoneFixture(t, 1, testhelper.CaptureConfig{
+		Stderr: "Audio device reported a capture discontinuity. Some audio may be missing.\n",
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	level := float64(0)

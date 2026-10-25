@@ -222,6 +222,30 @@ func TestStopBoundsUncooperativeNetworkAndRejectsLateUpdate(t *testing.T) {
 	}
 }
 
+func TestCaptureWarningDoesNotFailMeeting(t *testing.T) {
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{
+		Frames: serviceAudioFrames(),
+		Stderr: "Warning: Audio device reported a capture discontinuity. Some audio may be missing.\n",
+	})
+	ctx := context.Background()
+	if err := s.Start(ctx, cfg, "key", "warning remains nonfatal"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if snapshot := s.Snapshot(); snapshot.State != Recording || snapshot.Error != "" {
+		t.Fatalf("nonfatal helper warning failed capture: %+v", snapshot)
+	}
+	s.op.Lock()
+	restarts := s.captureRestarts
+	s.op.Unlock()
+	if restarts != 0 {
+		t.Fatalf("nonfatal helper warning triggered %d capture restarts", restarts)
+	}
+	if err := s.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCaptureInterruptionRecoversSameMeeting(t *testing.T) {
 	s, cfg := serviceFixture(t, testhelper.CaptureConfig{Interruptions: 2})
 	ctx := context.Background()

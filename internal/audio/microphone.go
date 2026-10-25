@@ -3,6 +3,7 @@ package audio
 import (
 	"context"
 	"errors"
+	"log/slog"
 )
 
 type MicrophoneResult struct {
@@ -25,6 +26,7 @@ func TestMicrophone(ctx context.Context, cfg CaptureConfig, onLevel func(float64
 		return result, nil
 	}
 	diagnostics := capture.Errors
+	warnings := capture.Warnings
 	for {
 		select {
 		case <-ctx.Done():
@@ -37,12 +39,27 @@ func TestMicrophone(ctx context.Context, cfg CaptureConfig, onLevel func(float64
 			if err != nil {
 				return result, err
 			}
+		case warning, ok := <-warnings:
+			if !ok {
+				warnings = nil
+				continue
+			}
+			if warning != nil {
+				slog.Warn("microphone test helper warning", "warning", warning)
+			}
 		case frame, ok := <-capture.Frames:
 			if !ok {
 				if diagnostics != nil {
 					for err := range diagnostics {
 						if err != nil {
 							return result, err
+						}
+					}
+				}
+				if warnings != nil {
+					for warning := range warnings {
+						if warning != nil {
+							slog.Warn("microphone test helper warning", "warning", warning)
 						}
 					}
 				}
