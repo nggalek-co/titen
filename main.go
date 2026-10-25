@@ -936,7 +936,6 @@ func (d *desktop) settingsView(c *ui.Context) {
 		ui.Row(c).Padding(12, 16).Gap(12).Radius(t.Radius).Border(1, t.Border).AlignItems(ui.Center).Children(func() {
 			components.Icon(c, lucide.KeyRound()).Size(16, 16).TextColor(t.TextMuted)
 			components.Text(c, d.trf(c, "tokenNote", map[string]any{"store": platform.CredentialStore(runtime.GOOS)})).FontSize(12).FontWeight(500).Grow(1)
-			components.Button(c, d.tr(c, "saveSettings"), components.ButtonPrimary).Disabled(d.busy || d.microphoneTesting || d.snapshot.State != app.Idle && d.snapshot.State != app.Paused).OnClick(d.save)
 			components.Button(c, d.tr(c, "openLogs"), components.ButtonSecondary).OnClick(func() {
 				mygo.Shell.ShowItemInFolder(filepath.Join(d.dir, "logs", "titen.log"))
 			})
@@ -1042,6 +1041,10 @@ func (d *desktop) settingsView(c *ui.Context) {
 				})
 				components.Text(c, d.tr(c, "headphonesNote")).FontSize(11).TextColor(t.TextMuted)
 			}).Grow(1).Basis(380).MinWidth(320)
+		})
+		ui.Row(c).FillWidth().Children(func() {
+			ui.Spacer(c)
+			components.Button(c, d.tr(c, "saveSettings"), components.ButtonPrimary).Disabled(d.busy || d.microphoneTesting || d.snapshot.State != app.Idle && d.snapshot.State != app.Paused).OnClick(d.save)
 		})
 	})
 }
