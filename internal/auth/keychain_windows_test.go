@@ -67,3 +67,29 @@ func TestCredentialManagerRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestCredentialManagerDelete(t *testing.T) {
+	if os.Getenv("TITEN_TEST_CREDENTIALS") != "1" {
+		t.Skip("set TITEN_TEST_CREDENTIALS=1 on an ephemeral Windows test runner")
+	}
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		t.Fatal(err)
+	}
+	key := fmt.Sprintf("integration-test-%x", random)
+	if err := DeleteSecret(key); err != nil {
+		t.Fatalf("delete missing credential: %v", err)
+	}
+	if err := SetSecret(key, "dummy-token"); err != nil {
+		t.Fatalf("save dummy credential: %v", err)
+	}
+	if err := DeleteSecret(key); err != nil {
+		t.Fatalf("delete dummy credential: %v", err)
+	}
+	if got, err := GetSecret(key); err == nil && got != "" {
+		t.Fatalf("deleted credential returned %q", got)
+	}
+	if err := DeleteSecret(key); err != nil {
+		t.Fatalf("second delete: %v", err)
+	}
+}

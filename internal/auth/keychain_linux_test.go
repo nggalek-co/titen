@@ -51,3 +51,26 @@ func TestMissingSecretIsEmpty(t *testing.T) {
 		t.Fatalf("missing secret returned %q, %v", got, err)
 	}
 }
+
+func TestSecretServiceDelete(t *testing.T) {
+	if os.Getenv("TITEN_TEST_CREDENTIALS") != "1" {
+		t.Skip("set TITEN_TEST_CREDENTIALS=1 on a Linux desktop with a Secret Service")
+	}
+	if err := DeleteSecret(testKey(t)); err != nil {
+		t.Fatalf("delete missing secret: %v", err)
+	}
+	key := testKey(t)
+	if err := SetSecret(key, "dummy-token"); err != nil {
+		t.Fatalf("save dummy secret: %v", err)
+	}
+	if err := DeleteSecret(key); err != nil {
+		t.Fatalf("delete dummy secret: %v", err)
+	}
+	got, err := GetSecret(key)
+	if err != nil || got != "" {
+		t.Fatalf("deleted secret returned %q, %v", got, err)
+	}
+	if err := DeleteSecret(key); err != nil {
+		t.Fatalf("second delete: %v", err)
+	}
+}

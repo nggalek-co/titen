@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"syscall"
@@ -17,6 +18,7 @@ var (
 	credentialDLL = syscall.NewLazyDLL("advapi32.dll")
 	credWrite     = credentialDLL.NewProc("CredWriteW")
 	credRead      = credentialDLL.NewProc("CredReadW")
+	credDelete    = credentialDLL.NewProc("CredDeleteW")
 	credFree      = credentialDLL.NewProc("CredFree")
 )
 
@@ -87,4 +89,20 @@ func GetSecret(key string) (string, error) {
 		return "", fmt.Errorf("Credential Manager returned an invalid credential")
 	}
 	return string(unsafe.Slice(credential.CredentialBlob, int(credential.CredentialBlobSize))), nil
+}
+
+func DeleteSecret(key string) error {
+	target, err := credentialTarget(key)
+	if err != nil {
+		return err
+	}
+	result, _, callErr := credDelete.Call(uintptr(unsafe.Pointer(target)), credentialGeneric, 0)
+	runtime.KeepAlive(target)
+	if result == 0 {
+		if errors.Is(callErr, syscall.ERROR_NOT_FOUND) {
+			return nil
+		}
+		return fmt.Errorf("Credential Manager delete failed: %w", callErr)
+	}
+	return nil
 }
