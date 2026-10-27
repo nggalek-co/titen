@@ -10,6 +10,8 @@ On Apple silicon, `scripts/verify-macos-signing.sh` built the app twice with the
 
 [Desktop builds run 40076453477](https://github.com/nggalek-co/titen/actions/runs/40076453477) passed all three native jobs: macOS ARM64, macOS Intel, and Windows AMD64. The Windows runner compiled the WASAPI helper, passed its hardware-free CTest, packaged the app and installer, and upgraded from installer 0.0.1 to 0.0.2 while preserving `%APPDATA%\Titen\settings.json` byte-for-byte.
 
+[Linux run 40475699173](https://github.com/nggalek-co/titen/actions/runs/40475699173) passed the Ubuntu 24.04 job: race suite, vet, helper self-test, MyGo package build, packagecheck, and artifact upload. The downloaded `Titen-linux-amd64` artifact contained `Titen-dev-linux-amd64.tar.gz`, `titen_0.0.0_amd64.deb`, and both SHA256 files. Running packagecheck against the downloaded artifact verified the archive and the Debian package again.
+
 The pull request build intentionally has no update-signing key, so it does not create signed MyGo updater assets. The `v0.0.1` tag run will verify that secret-backed release path and publish the GitHub Release.
 
 ## Unverified boundaries
@@ -36,4 +38,4 @@ The packaged app launched from `build/linux-amd64/Titen`. Its log reported `audi
 
 ### Linux unverified boundaries
 
-Live capture was not assessed: the short fallback capture above was discarded, and simultaneous sources, the selected device, default-sink changes, headphones, long meetings, and provider access were not exercised. The helper derives timestamps from a shared sample clock rather than server presentation time. The app captures only the default sink's monitor and does not follow a later default-sink change. The Ubuntu CI job has not run yet. Stock Ubuntu desktop runtime packages, non-GNOME Secret Service providers, and Linux ARM64 packaging remain untested. Installing the Debian package with `apt` on a clean system, signing the package, and updating it from an apt repository were not exercised.
+Live capture was not assessed: the short fallback capture above was discarded, and simultaneous sources, the selected device, default-sink changes, headphones, long meetings, and provider access were not exercised. The helper derives timestamps from a shared sample clock rather than server presentation time. The app captures only the default sink's monitor and does not follow a later default-sink change. Stock Ubuntu desktop runtime packages, non-GNOME Secret Service providers, and Linux ARM64 packaging remain untested. Installing the Debian package with `apt` on a clean system, signing the package, and updating it from an apt repository were not exercised.
