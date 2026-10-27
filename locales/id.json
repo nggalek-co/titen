@@ -103,6 +103,7 @@
   "invalidEndpoint": "Endpoint server tidak valid",
   "settingsSaved": "Pengaturan tersimpan",
   "done": "Selesai",
+  "dismiss": "Tutup",
   "waitBeforeQuit": "Tunggu operasi yang sedang berjalan sebelum keluar",
   "menuBarUnavailable": "Menu bar tidak tersedia.",
   "recordingDidNotStart": "{detail}; perekaman tidak dimulai",
