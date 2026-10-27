@@ -37,3 +37,10 @@ func GetSecret(key string) (string, error) {
 	}
 	return string(value), nil
 }
+
+func DeleteSecret(key string) error {
+	if err := secretStore.Delete(key); err != nil {
+		return secretError("remove the token from the desktop Secret Service", err)
+	}
+	return nil
+}

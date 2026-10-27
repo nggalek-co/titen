@@ -1,4 +1,4 @@
-//go:build !darwin && !windows && !linux
+//go:build (!darwin && !windows && !linux) || (darwin && !cgo)
 
 package auth
 
@@ -9,4 +9,7 @@ func SetSecret(key, value string) error {
 }
 func GetSecret(key string) (string, error) {
 	return "", fmt.Errorf("secure credential storage is currently supported on macOS, Windows, and Linux")
+}
+func DeleteSecret(key string) error {
+	return fmt.Errorf("secure credential storage is currently supported on macOS, Windows, and Linux")
 }
