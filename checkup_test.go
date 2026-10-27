@@ -25,7 +25,7 @@ func TestRecordingRequiresPassedChecks(t *testing.T) {
 		{"account unavailable", audioReady, endpointDown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d := &desktop{audioPhase: tc.audio, endpoint: endpointStatus{health: tc.account}, page: "Record", snapshot: app.Snapshot{State: app.Idle}}
+			d := &desktop{audioPhase: tc.audio, endpoint: endpointStatus{health: tc.account}, deviceToken: "token", page: "Record", snapshot: app.Snapshot{State: app.Idle}}
 			if d.canRecord() {
 				t.Fatal("recording allowed before requirements passed")
 			}

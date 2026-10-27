@@ -45,7 +45,7 @@ func testView(d *desktop) func(*ui.Context) {
 }
 
 func TestNativeScreens(t *testing.T) {
-	d := &desktop{settings: app.Settings{ServerEndpoint: "http://localhost:3000", CaptureMode: "Both", Language: "en"}, page: "Record", snapshot: app.Snapshot{State: app.Idle}, microphone: "System default"}
+	d := &desktop{settings: app.Settings{ServerEndpoint: "http://localhost:3000", CaptureMode: "Both", Language: "en"}, deviceToken: "token", page: "Record", snapshot: app.Snapshot{State: app.Idle}, microphone: "System default"}
 	tt := ui.NewTester(testView(d), 1000, 760)
 	if !tt.HasText("Start recording") || !tt.HasText("Microphone") || !tt.HasText("System audio") {
 		t.Fatalf("recording controls missing: %v", tt.Texts())
