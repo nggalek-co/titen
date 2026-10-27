@@ -1,6 +1,6 @@
 # Cross-platform desktop builds
 
-This change ports the existing recorder to macOS and Windows. The web UI and SaaS backend live in the separate [titen-web repository](../../../titen-web), which owns [PRD 002](../../../titen-web/docs/prd/002.md). The desktop stores an endpoint and device token, authorizes transcription sessions, and streams audio to this API.
+This change ports the existing recorder to macOS, Windows, and Linux. The web UI and SaaS backend live in the separate [titen-web repository](../../../titen-web), which owns [PRD 002](../../../titen-web/docs/prd/002.md). The desktop stores an endpoint and device token, authorizes transcription sessions, and streams audio to this API.
 
 ## Shared code and platform ownership
 
@@ -10,39 +10,44 @@ This change ports the existing recorder to macOS and Windows. The web UI and Saa
 | SQLite | modernc SQLite through database/sql, using the existing on-disk schema and transaction rules. |
 | macOS capture | Swift ScreenCaptureKit for system/both sources and AVFoundation for microphone only. |
 | Windows capture | C++ WASAPI microphone and default render-endpoint loopback, with shared monotonic QPC timestamps. |
-| Credentials | Native macOS Security framework and Windows Credential Manager. |
+| Linux capture | Go helper over `pactl` and `parec` for the selected microphone and the default playback monitor, with one shared sample clock. |
+| Credentials | Native macOS Security framework, Windows Credential Manager, and the Linux Secret Service through MyGo's libsecret bridge. |
 | Native capture IPC | TIT1 signed PCM16 frames over binary stdout; stdin newline or EOF requests stop. |
-| Packaging | Native macOS app bundle and Windows per-user MyGo installer plus portable ZIP, each containing its capture helper. |
+| Packaging | Native macOS app bundle, Windows per-user MyGo installer plus portable ZIP, and a Linux Debian package plus portable tar.gz, each containing its capture helper. |
 
-The temporary audio spool uses POSIX unlink on macOS and an exclusively opened delete-on-close handle on Windows. Both paths remove temporary audio when the process releases its handle.
+The temporary audio spool uses POSIX unlink on macOS and Linux and an exclusively opened delete-on-close handle on Windows. Both paths remove temporary audio when the process releases its handle.
 
-Both native helpers retain source identity. Windows emits native-rate mono PCM16 and the shared pipeline resamples it. Device enumeration returns stable native endpoint IDs with display names.
+All helpers retain source identity. Windows emits native-rate mono PCM16 and the shared pipeline resamples it. Device enumeration returns stable native endpoint IDs with display names. Linux source IDs are PulseAudio source names.
 
-The portable Go helper test fixture replaces shell scripts. Windows runs capture lifecycle, microphone-meter, SQLite, cloud mock, and native UI tester tests without skipping them for lack of a Unix shell. A Windows-only credential test writes and deletes a uniquely named dummy credential on the ephemeral CI runner when TITEN_TEST_CREDENTIALS=1.
+The Linux helper is Go rather than native C. It keeps the TIT1 format and the one-process boundary, needs no compiler packages, and delegates PulseAudio access to `pactl` and `parec`. Sources are listed as JSON. Microphone capture uses the selected source or `@DEFAULT_SOURCE@`; playback capture uses `@DEFAULT_MONITOR@`, so it follows the default sink. Timestamps come from one capture start and per-source sample counters, not from server presentation time.
+
+The portable Go helper test fixture replaces shell scripts. Windows runs capture lifecycle, microphone-meter, SQLite, cloud mock, and native UI tester tests without skipping them for lack of a Unix shell. Credential tests for Windows and Linux write and delete a uniquely named dummy secret when TITEN_TEST_CREDENTIALS=1. Linux CI leaves it unset because the runner has no Secret Service.
 
 ## Build workflow
 
-The workflow in .github/workflows/desktop.yml uses native macos-15 ARM64, macos-15-intel AMD64, and windows-2025 AMD64 runners. It verifies architecture, tests, vets, builds, checks packaged binary formats and checksums, then uploads artifacts. On macOS the race suite runs. Windows tests and application compilation run with CGO_ENABLED=0. The Windows native helper is compiled with MSVC and its hardware-free self-test runs through CTest. Windows CI also installs two consecutive per-user packages and verifies the release version changes while the existing settings file survives. Pushed version tags publish a GitHub Release with platform packages and the signed MyGo update archive.
+The workflow in .github/workflows/desktop.yml uses native macos-15 ARM64, macos-15-intel AMD64, windows-2025 AMD64, and ubuntu-24.04 AMD64 runners. It verifies architecture, tests, vets, builds, checks packaged binary formats and checksums, then uploads artifacts. On macOS the race suite runs. Windows tests and application compilation run with CGO_ENABLED=0. Linux runs the race suite, builds the app and Go helper with CGO_ENABLED=0, checks the helper self-test, and builds the Debian package with MyGo. The Linux job removes MyGo's unused WebKitGTK dependency from the package and declares `pulseaudio-utils` and `libsecret-1-0` instead. The Windows native helper is compiled with MSVC and its hardware-free self-test runs through CTest. Windows CI also installs two consecutive per-user packages and verifies the release version changes while the existing settings file survives. Pushed version tags publish a GitHub Release with platform packages and the signed MyGo update archive.
 
-Windows Credential Manager is implemented without Cgo. macOS retains its existing native Security framework bridge and therefore builds with Cgo. Modernc removes the former system SQLite linker dependency on both platforms.
+Windows Credential Manager is implemented without Cgo. macOS retains its existing native Security framework bridge and therefore builds with Cgo. Linux uses MyGo's libsecret bridge without Cgo. Modernc removes the former system SQLite linker dependency on all three platforms.
 
 Tag pushes matching v* build the tagged commit and publish a GitHub Release after all platform checks pass. Pull requests and manual dispatch exercise the same jobs with the development version. Tagged macOS builds use the persistent self-signed PKCS#12 certificate and password from repository secrets; other macOS runs create an ephemeral self-signed identity. Tagged Windows builds use the persistent MyGo update key from a repository secret. Actions have pinned revisions, read-only permissions except for the release publisher, and no provider or payment credentials.
 
-Artifacts are platform-specific ZIP files and matching SHA256 files. cmd/packagecheck validates archive contents, Mach-O or PE CPU type, executable permissions for macOS, and the recorded checksum. This verifies the packaged files, not merely the staging directory.
+Artifacts are macOS and Windows ZIP files, a Linux tar.gz and Debian package, and matching SHA256 files. cmd/packagecheck validates archive contents, Mach-O, PE, or ELF CPU type, executable permissions for macOS and Linux, the Debian control fields and payload, and the recorded checksums. This verifies the packaged files, not merely the staging directory.
 
 ## Compatibility
 
 The legacy.sqlite fixture was generated by native SQLite with the existing schema. The new driver must read those records and add new records correctly. Existing user databases remain SQLite files at the same per-user path. No transcript upload or credential migration occurs.
 
-The desktop resolves the helper beside its executable before looking in native development build paths. Browser authorization uses MyGo's cross-platform external-browser API. Windows helper processes do not create console windows.
+The desktop resolves the helper beside its executable before looking in native development build paths. Browser authorization uses MyGo's cross-platform external-browser API. Windows helper processes do not create console windows. Linux development builds look for the helper under `build/linux`.
+
+Linux needs GTK 3 for the native UI, `pulseaudio-utils` for `pactl` and `parec`, and libsecret with a running Secret Service provider such as GNOME Keyring or KWallet. The Debian package installs the app under `/opt/titen`, adds the desktop entry, icon, and `titen` command, and declares those runtime dependencies. The app reports a focused error when the Secret Service is unavailable instead of writing the device token to `settings.json`.
 
 ## Acceptance limits
 
-Hosted CI does not prove physical capture. Validate simultaneous microphone and loopback, headphones, the selected device, default device changes, permission denial, provider access, and a sustained meeting on real hardware for each target. The Windows helper stops with an actionable error when its active/default endpoint changes. Automatic recovery is not claimed for that Windows error path.
+Hosted CI does not prove physical capture. Validate simultaneous microphone and loopback, headphones, the selected device, default device changes, permission denial, provider access, and a sustained meeting on real hardware for each target. The Windows helper stops with an actionable error when its active/default endpoint changes. Automatic recovery is not claimed for that Windows error path. The Linux helper connects to the default monitor when capture starts, so a later default-sink change is not followed until recording restarts, and playback from a non-default sink is not recorded.
 
-Linux and Windows ARM64 capture are future work. Windows 10 x64 is the intended minimum, but native CI currently runs on Windows Server 2025. Real Windows 10/11 compatibility needs device testing. macOS 15 is the deployment minimum; CI uses macOS 15 hosts.
+Windows ARM64 capture is future work. Windows 10 x64 is the intended minimum, but native CI currently runs on Windows Server 2025. Real Windows 10/11 compatibility needs device testing. macOS 15 is the deployment minimum; CI uses macOS 15 hosts. Linux AMD64 is the packaged target and CI host; the script also builds ARM64, but no ARM64 package is published.
 
-Windows executables and installers have no Authenticode signature. MyGo updates use a separate persistent Ed25519 key, which authenticates update archives but does not establish a Windows publisher identity or suppress SmartScreen. The installer is per-user and does not touch `%APPDATA%\Titen`. See the root README for microphone privacy settings and the update secret. macOS packages are self-signed and not notarized Developer ID distribution. Gatekeeper can show an unidentified developer warning on first launch. See the root README for the one-time signing certificate and GitHub Secrets setup.
+Windows executables and installers have no Authenticode signature. MyGo updates use a separate persistent Ed25519 key, which authenticates update archives but does not establish a Windows publisher identity or suppress SmartScreen. The installer is per-user and does not touch `%APPDATA%\Titen`. See the root README for microphone privacy settings and the update secret. macOS packages are self-signed and not notarized Developer ID distribution. Gatekeeper can show an unidentified developer warning on first launch. See the root README for the one-time signing certificate and GitHub Secrets setup. The Linux Debian package is unsigned and is not served from an apt repository, so there is no automatic update path.
 
 ## References
 

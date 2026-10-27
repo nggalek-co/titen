@@ -20,6 +20,8 @@ func HelperPath(targetOS, executable, projectDir string) string {
 		candidates = []string{filepath.Join(projectDir, "native", "macos", ".build", "release", name)}
 	case "windows":
 		candidates = []string{filepath.Join(projectDir, "build", "windows-audio", "Release", name), filepath.Join(projectDir, "build", "windows-audio", name)}
+	case "linux":
+		candidates = []string{filepath.Join(projectDir, "build", "linux", name)}
 	}
 	for _, candidate := range candidates {
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
@@ -35,6 +37,8 @@ func CredentialStore(targetOS string) string {
 		return "macOS Keychain"
 	case "windows":
 		return "Windows Credential Manager"
+	case "linux":
+		return "the desktop Secret Service"
 	default:
 		return "the OS credential store"
 	}
