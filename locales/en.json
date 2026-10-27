@@ -103,7 +103,6 @@
   "invalidEndpoint": "Invalid server endpoint",
   "settingsSaved": "Settings saved",
   "done": "Done",
-  "dismiss": "Dismiss",
   "waitBeforeQuit": "Wait for the current operation before quitting",
   "menuBarUnavailable": "Menu bar unavailable.",
   "recordingDidNotStart": "{detail}; recording did not start",

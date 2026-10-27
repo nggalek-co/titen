@@ -62,25 +62,6 @@ const (
 	audioFailed
 )
 
-type noticeLevel int
-
-const (
-	noticeInfo noticeLevel = iota
-	noticeWarning
-	noticeError
-)
-
-type notice struct {
-	level  noticeLevel
-	text   string
-	action *noticeAction // optional; nil renders no action button
-}
-
-type noticeAction struct {
-	label string
-	fn    func()
-}
-
 type desktop struct {
 	audioCheck                             string
 	audioPhase                             audioCheckPhase
@@ -100,8 +81,7 @@ type desktop struct {
 	title, search                          string
 	endpointInput, deviceCode, deviceToken string
 	endpoint                               endpointStatus
-	notice                                 notice
-	errorAck                               string
+	message                                string
 	snapshot                               app.Snapshot
 	meetings                               []storage.Meeting
 	detail                                 []transcript.Segment
@@ -131,19 +111,13 @@ func (d *desktop) async(work func() error) {
 		d.win.Update(func() {
 			d.busy = false
 			if err != nil {
-				d.fail(err)
+				d.message = err.Error()
 			} else {
-				d.note("done")
+				d.message = locales.T("done")
 			}
 		})
 	}()
 }
-
-func (d *desktop) post(n notice)        { d.notice = n }
-func (d *desktop) note(key string)      { d.post(notice{level: noticeInfo, text: locales.T(key)}) }
-func (d *desktop) warn(key string)      { d.post(notice{level: noticeWarning, text: locales.T(key)}) }
-func (d *desktop) fail(err error)       { d.post(notice{level: noticeError, text: err.Error()}) }
-func (d *desktop) failText(text string) { d.post(notice{level: noticeError, text: text}) }
 
 // tr formats a catalog message for the frame's locale.
 func (d *desktop) tr(c *ui.Context, key string) string {
@@ -181,7 +155,7 @@ func (d *desktop) connectAccount() {
 		}
 		d.win.Update(func() {
 			d.deviceCode = code.Code
-			d.note("approveInBrowser")
+			d.message = locales.T("approveInBrowser")
 		})
 		ctx, cancel := context.WithDeadline(d.root, code.ExpiresAt)
 		defer cancel()
@@ -224,7 +198,7 @@ func (d *desktop) needsSignIn() bool {
 
 func (d *desktop) resume() {
 	if !d.canRecord() || d.snapshot.State != app.Paused {
-		d.warn("checkupRequired")
+		d.message = locales.T("checkupRequired")
 		return
 	}
 	d.async(func() error { return d.service.Resume(d.root) })
@@ -232,7 +206,7 @@ func (d *desktop) resume() {
 
 func (d *desktop) start() {
 	if !d.canRecord() || d.snapshot.State != app.Idle {
-		d.warn("checkupRequired")
+		d.message = locales.T("checkupRequired")
 		return
 	}
 	cfg, title := d.settings, d.title
@@ -241,7 +215,7 @@ func (d *desktop) start() {
 		var err error
 		key, err = auth.GetSecret(saas.TokenKey(cfg.ServerEndpoint))
 		if err != nil || key == "" {
-			d.post(notice{level: noticeWarning, text: d.t("signInFirst"), action: &noticeAction{label: locales.T("navSettings"), fn: func() { d.page = "Settings" }}})
+			d.message = locales.T("signInFirst")
 			return
 		}
 	}
@@ -334,7 +308,7 @@ func (d *desktop) save() {
 	}
 	endpoint, err := saas.NormalizeEndpoint(d.endpointInput)
 	if err != nil {
-		d.fail(err)
+		d.message = err.Error()
 		return
 	}
 	cfg.ServerEndpoint = endpoint
@@ -360,7 +334,7 @@ func (d *desktop) save() {
 			}
 			d.applyLanguage()
 			d.refreshLocale()
-			d.note("settingsSaved")
+			d.message = locales.T("settingsSaved")
 			d.probe()
 		})
 		return nil
@@ -655,7 +629,6 @@ func (d *desktop) view(c *ui.Context) {
 					})
 				})
 			}
-			d.alertBand(c)
 			switch d.page {
 			case "History":
 				d.historyView(c)
@@ -685,49 +658,19 @@ func (d *desktop) view(c *ui.Context) {
 					components.Text(c, d.tr(c, "transcriptionReconnecting")).FontSize(11).FontWeight(500).TextColor(t.Warning).SingleLine()
 				})
 			}
-			if d.notice.level == noticeInfo && d.notice.text != "" {
+			if d.snapshot.Error != "" {
+				ui.Row(c).Padding(3, 10).Radius(999).Border(1, t.Danger).Children(func() {
+					components.Text(c, d.snapshot.Error).FontSize(11).FontWeight(500).TextColor(t.Danger).SingleLine()
+				})
+			}
+			if d.message != "" {
 				ui.Row(c).Padding(3, 10).Radius(999).Border(1, t.Border).Children(func() {
-					components.Text(c, d.notice.text).FontSize(11).FontWeight(500).SingleLine()
+					components.Text(c, d.message).FontSize(11).FontWeight(500).SingleLine()
 				})
 			}
 		})
 	})
 }
-
-// alertBand surfaces errors above the page: an unacknowledged snapshot error
-// and warning/error notices. Info notices stay in the footer pill.
-func (d *desktop) alertBand(c *ui.Context) {
-	t := c.Theme()
-	card := func(color ui.Color, icon *ui.SVG, text string, buttons func()) {
-		ui.Column(c).FillWidth().Padding(12).Gap(8).Radius(t.Radius).Border(1, color).Background(color.Alpha(0.08)).Children(func() {
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				components.Icon(c, icon).Size(16, 16).TextColor(color)
-				components.Text(c, text).FontSize(13).FontWeight(600).TextColor(color)
-			})
-			ui.Row(c).Gap(8).Children(buttons)
-		})
-	}
-	if d.snapshot.Error != "" && d.snapshot.Error != d.errorAck {
-		card(t.Danger, lucide.CircleX(), d.snapshot.Error, func() {
-			components.IconButton(c, lucide.X(), d.tr(c, "dismiss"), components.IconButtonCompact).
-				OnClick(func() { d.errorAck = d.snapshot.Error })
-		})
-	}
-	if d.notice.text != "" && d.notice.level != noticeInfo {
-		color, icon := t.Warning, lucide.TriangleAlert()
-		if d.notice.level == noticeError {
-			color, icon = t.Danger, lucide.CircleX()
-		}
-		card(color, icon, d.notice.text, func() {
-			if d.notice.action != nil {
-				components.Button(c, d.notice.action.label, components.ButtonSecondary).OnClick(d.notice.action.fn)
-			}
-			components.IconButton(c, lucide.X(), d.tr(c, "dismiss"), components.IconButtonCompact).
-				OnClick(func() { d.notice = notice{} })
-		})
-	}
-}
-
 func (d *desktop) recordView(c *ui.Context) {
 	t := c.Theme()
 	s := d.snapshot
@@ -1089,7 +1032,7 @@ func (d *desktop) settingsView(c *ui.Context) {
 						go func() {
 							defer d.tasks.Done()
 							if err := app.SaveSettings(d.dir, cfg); err != nil {
-								d.win.Update(func() { d.fail(err) })
+								d.win.Update(func() { d.message = err.Error() })
 							}
 						}()
 					}
@@ -1129,7 +1072,7 @@ func (d *desktop) settingsView(c *ui.Context) {
 					if runtime.GOOS == "windows" {
 						components.Button(c, d.tr(c, "micPrivacySettings"), components.ButtonSecondary).OnClick(func() {
 							if err := mygo.Shell.OpenExternal("ms-settings:privacy-microphone"); err != nil {
-								d.fail(err)
+								d.message = err.Error()
 							}
 						})
 					}
@@ -1224,7 +1167,7 @@ func (d *desktop) ready() {
 	}
 	d.tray, err = mygo.NewTray(mygo.TrayOptions{Icon: trayIcon(), ToolTip: locales.Tf("tipPrefix", map[string]any{"state": locales.T("state.Ready")}), Menu: d.trayMenu})
 	if err != nil {
-		d.failText(d.t("menuBarUnavailable") + " " + err.Error())
+		d.message = locales.T("menuBarUnavailable") + " " + err.Error()
 	}
 	d.probe()
 	d.refreshDevices()
@@ -1283,7 +1226,7 @@ func (d *desktop) ready() {
 			d.microphoneTestCancel()
 		}
 		if d.busy {
-			d.warn("waitBeforeQuit")
+			d.message = locales.T("waitBeforeQuit")
 			d.win.Show()
 		}
 		d.busy = true
