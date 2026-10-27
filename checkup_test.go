@@ -33,17 +33,17 @@ func TestRecordingRequiresPassedChecks(t *testing.T) {
 			if err := tt.Click("Start recording"); err != nil {
 				t.Fatal(err)
 			}
-			if d.message != "" || d.busy {
+			if d.notice.text != "" || d.busy {
 				t.Fatal("disabled recording button ran its action")
 			}
 			d.start()
-			if d.message == "" || d.busy {
+			if d.notice.text == "" || d.busy {
 				t.Fatal("start method did not reject incomplete requirements")
 			}
-			d.message = ""
+			d.notice = notice{}
 			d.snapshot.State = app.Paused
 			d.resume()
-			if d.message == "" || d.busy {
+			if d.notice.text == "" || d.busy {
 				t.Fatal("resume method did not reject incomplete requirements")
 			}
 		})
