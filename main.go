@@ -364,6 +364,14 @@ func classifyBudget(b saas.Budget, err error) endpointStatus {
 	return endpointStatus{health: endpointDown, detailKey: "serverUnreachable"}
 }
 
+// purgeRejectedToken deletes the stored credential only when it still holds
+// the value the server rejected, so a newer sign-in's token survives.
+func purgeRejectedToken(key, token string) {
+	if cur, err := auth.GetSecret(key); err == nil && cur == token {
+		_ = auth.DeleteSecret(key)
+	}
+}
+
 // probe refreshes the endpoint status pill. Read desktop fields on the UI
 // thread; the network call runs in a task goroutine.
 func (d *desktop) probe() {
@@ -373,27 +381,42 @@ func (d *desktop) probe() {
 	d.checkAudio()
 	endpoint := d.settings.ServerEndpoint
 	token := d.deviceToken
-	if token == "" {
-		var err error
-		token, err = auth.GetSecret(saas.TokenKey(endpoint))
-		if err == nil && token != "" {
-			d.deviceToken = token
-		}
-	}
-	if token == "" {
-		d.endpoint = endpointStatus{health: endpointAttention, detailKey: "notSignedIn"}
-		return
-	}
 	d.tasks.Add(1)
 	go func() {
 		defer d.tasks.Done()
+		if token == "" {
+			var err error
+			token, err = auth.GetSecret(saas.TokenKey(endpoint))
+			if err == nil && token != "" {
+				d.win.Update(func() {
+					if generation == d.endpointGeneration && d.deviceToken == "" {
+						d.deviceToken = token
+					}
+				})
+			}
+		}
+		if token == "" {
+			d.win.Update(func() {
+				if generation == d.endpointGeneration {
+					d.endpoint = endpointStatus{health: endpointAttention, detailKey: "notSignedIn"}
+				}
+			})
+			return
+		}
 		ctx, cancel := context.WithTimeout(d.root, 10*time.Second)
 		defer cancel()
 		budget, err := (&saas.Client{BaseURL: endpoint, Token: token}).Budget(ctx)
 		status := classifyBudget(budget, err)
+		if status.detailKey == "signInRequired" {
+			purgeRejectedToken(saas.TokenKey(endpoint), token)
+		}
 		slog.Info("account check completed", "health", status.health, "minutes_left", status.minutesLeft, "error", err)
 		d.win.Update(func() {
 			if generation == d.endpointGeneration {
+				if status.detailKey == "signInRequired" {
+					d.deviceToken = ""
+					d.deviceCode = ""
+				}
 				d.endpoint = status
 			}
 		})
@@ -1273,12 +1296,19 @@ func main() {
 		os.Exit(1)
 	}
 	endpoint := cfg.ServerEndpoint
-	token, _ := auth.GetSecret(saas.TokenKey(endpoint))
-	d := &desktop{service: app.NewService(store), store: store, dir: dir, settings: cfg, endpointInput: endpoint, deviceToken: token, page: "Record", root: ctx, cancel: cancel, microphone: "System default"}
+	d := &desktop{service: app.NewService(store), store: store, dir: dir, settings: cfg, endpointInput: endpoint, page: "Record", root: ctx, cancel: cancel, microphone: "System default"}
 	d.service.RecordingsDir = filepath.Join(dir, "recordings")
-	if token != "" {
-		go d.service.ResumeAudioUploads(ctx, &saas.Client{BaseURL: endpoint, Token: token})
-	}
+	// Keychain calls never run on the main thread: a stalled securityd reply
+	// would freeze startup before the window opens and block every quit.
+	d.tasks.Add(1)
+	go func() {
+		defer d.tasks.Done()
+		token, err := auth.GetSecret(saas.TokenKey(endpoint))
+		if err != nil || token == "" {
+			return
+		}
+		d.service.ResumeAudioUploads(ctx, &saas.Client{BaseURL: endpoint, Token: token})
+	}()
 	d.liveList.FollowEnd = true
 	if cfg.MicrophoneID != "" {
 		d.microphone = cfg.MicrophoneID
