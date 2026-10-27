@@ -174,8 +174,26 @@ func (d *desktop) connectAccount() {
 		return nil
 	})
 }
+func (d *desktop) signOut() {
+	if d.snapshot.State != app.Idle {
+		return
+	}
+	endpoint := d.settings.ServerEndpoint
+	d.async(func() error {
+		if key := saas.TokenKey(endpoint); key != "" {
+			if err := auth.DeleteSecret(key); err != nil {
+				return err
+			}
+		}
+		d.win.Update(func() { d.deviceToken = ""; d.deviceCode = ""; d.probe() })
+		return nil
+	})
+}
 func (d *desktop) canRecord() bool {
 	return !d.busy && !d.microphoneTesting && d.audioPhase == audioReady && d.endpoint.health == endpointReady
+}
+func (d *desktop) needsSignIn() bool {
+	return d.deviceToken == "" || d.endpoint.detailKey == "signInRequired"
 }
 
 func (d *desktop) resume() {
@@ -304,6 +322,9 @@ func (d *desktop) save() {
 		}
 		if err := app.SaveSettings(d.dir, cfg); err != nil {
 			return err
+		}
+		if old != cfg.ServerEndpoint {
+			_ = auth.DeleteSecret(saas.TokenKey(old))
 		}
 		d.win.Update(func() {
 			d.settings = cfg
@@ -672,13 +693,20 @@ func (d *desktop) recordView(c *ui.Context) {
 			ui.Spacer(c)
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 				if s.State == app.Idle {
-					// Set disabled on the parent before constructing the styled button,
-					// so Onevra applies its disabled appearance as well as semantics.
-					ui.Row(c).Disabled(!d.canRecord()).Children(func() {
-						components.Button(c, d.tr(c, "startRecording"), components.ButtonPrimary).
-							Label(d.tr(c, "startRecording")).
-							OnClick(d.start)
-					})
+					if d.needsSignIn() {
+						components.Button(c, d.tr(c, "signInToRecord"), components.ButtonPrimary).Disabled(d.busy).OnClick(d.connectAccount)
+						if d.deviceCode != "" {
+							components.Text(c, d.trf(c, "approveCode", map[string]any{"code": d.deviceCode})).FontSize(12).FontWeight(600)
+						}
+					} else {
+						// Set disabled on the parent before constructing the styled button,
+						// so Onevra applies its disabled appearance as well as semantics.
+						ui.Row(c).Disabled(!d.canRecord()).Children(func() {
+							components.Button(c, d.tr(c, "startRecording"), components.ButtonPrimary).
+								Label(d.tr(c, "startRecording")).
+								OnClick(d.start)
+						})
+					}
 				} else {
 					if s.State == app.Recording {
 						components.Button(c, d.tr(c, "pause"), components.ButtonSecondary).
@@ -974,6 +1002,9 @@ func (d *desktop) settingsView(c *ui.Context) {
 				})
 				ui.Row(c).Gap(10).AlignItems(ui.Center).Wrap().Children(func() {
 					components.Button(c, d.tr(c, "signInBrowser"), components.ButtonSecondary).Disabled(d.busy || d.snapshot.State != app.Idle).OnClick(d.connectAccount)
+					if d.deviceToken != "" {
+						components.Button(c, d.tr(c, "signOut"), components.ButtonSecondary).Disabled(d.busy || d.snapshot.State != app.Idle).OnClick(d.signOut)
+					}
 					status := d.tr(c, "notSignedIn")
 					if d.deviceToken != "" {
 						status = d.tr(c, "signedIn")
