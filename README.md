@@ -1,8 +1,8 @@
 # Titen
 
-Titen is a native desktop meeting transcription application for macOS and Windows built with MyGo native GPU widgets, Go, and platform-specific native capture helpers. It captures microphone and playback audio, streams mixed speech directly to Soniox with a temporary key issued by Titen, and saves finalized transcripts in SQLite.
+Titen is a native desktop meeting transcription application for macOS, Windows, and Linux built with MyGo native GPU widgets, Go, and platform-specific native capture helpers. It captures microphone and playback audio, streams mixed speech directly to Soniox with a temporary key issued by Titen, and saves finalized transcripts in SQLite.
 
-The macOS application builds locally. Windows builds and tests run on GitHub-hosted Windows runners. Live capture and hosted provider acceptance remain unverified in this environment. Read [verification results](docs/verification.md) before relying on it for a meeting.
+The macOS application builds locally. The desktop workflow builds and tests Windows on a GitHub-hosted Windows runner and Linux on an Ubuntu runner. Live capture and hosted provider acceptance remain unverified in this environment. Read [verification results](docs/verification.md) before relying on it for a meeting.
 
 The web UI and SaaS backend are implemented separately in [titen-web](../titen-web), which also owns [PRD 002](../titen-web/docs/prd/002.md). It contains account management, prepaid billing, device authorization, transcription sessions, and Google integration. The desktop signs in through the web account, requests temporary Soniox credentials, and uploads finalized transcript segments through authenticated heartbeats. See [direct streaming](docs/saas-integration/direct-soniox.md) for the matching backend contract and billing limits.
 
@@ -43,17 +43,45 @@ The native helper has a hardware-free protocol and conversion test.
 ./build/windows-audio/Release/titen-audio.exe --self-test
 ```
 
-The first supported release targets macOS ARM64, macOS Intel, and Windows AMD64. Linux and Windows ARM64 capture are not included. Physical Windows capture remains a separate acceptance test from compilation and protocol tests.
+The first supported release targets macOS ARM64, macOS Intel, Windows AMD64, and Linux AMD64. Windows ARM64 capture is not included. Physical capture remains a separate acceptance test from compilation and protocol tests.
+
+## Linux builds
+
+Ubuntu 24.04 and its derivatives on AMD64 are the Linux target. Build with Go 1.27.1 or later. The helper is Go, so no C compiler packages are needed.
+
+```sh
+sh scripts/build-linux.sh
+./build/linux-amd64/Titen/titen
+```
+
+The build produces a portable archive in `dist` and stages the app at `build/linux-amd64/Titen`. Keep `titen` and `titen-audio` together; the app looks for the helper beside its executable. The archive is `Titen-<version>-linux-amd64.tar.gz` with a matching SHA256 file. There is no installer, desktop entry, or automatic update path yet.
+
+The Linux runtime needs GTK 3 for the native UI, `pactl` and `parec` from `pulseaudio-utils`, and libsecret with a running Secret Service provider such as GNOME Keyring or KWallet. On Debian and Ubuntu:
+
+```sh
+sudo apt install libgtk-3-0 pulseaudio-utils libsecret-1-0
+```
+
+Linux capture uses the selected PulseAudio source for the microphone and the default sink's monitor for playback. Source names from `titen-audio --list-devices` are stored in Settings. A saved microphone that no longer exists is rejected before capture starts. A later default-sink change is not followed until recording restarts. If either `parec` process exits, capture stops with the helper's error message.
+
+The device token is stored in the desktop Secret Service. If no Secret Service is available, sign-in reports an error instead of writing the token to `settings.json`.
+
+The helper has a hardware-free protocol and source-filtering test.
+
+```sh
+./build/linux-amd64/Titen/titen-audio --self-test
+```
 
 ## GitHub builds on version tags
 
 The Desktop builds workflow runs native checks and packages pull requests, pushes to main, manual dispatches, and tags matching `v*`. A successful tag run also publishes a GitHub Release. For example, pushing `v1.2.3` builds that exact tagged source.
 
-Each successful run uploads three downloadable GitHub Actions artifacts. The Windows artifact also contains the per-user installer and, for tagged builds, MyGo's signed updater manifest and archive. A tag run publishes these assets alongside the platform ZIPs and checksums.
+Each successful run uploads four downloadable GitHub Actions artifacts. The Windows artifact also contains the per-user installer and, for tagged builds, MyGo's signed updater manifest and archive. A tag run publishes these assets alongside the platform archives and checksums.
 
 - `Titen-macos-arm64` contains the Apple silicon app and Swift helper.
 - `Titen-macos-amd64` contains the Intel app and Swift helper.
 - `Titen-windows-amd64` contains the Windows application and WASAPI helper.
+- `Titen-linux-amd64` contains the Linux application and PulseAudio helper.
 
 Download CI artifacts from the workflow run's Artifacts section. Version tags set the embedded application version and archive filenames. A failed platform build blocks publication of the release.
 
@@ -86,7 +114,7 @@ See [cross-platform architecture and verification](docs/cross-platform/README.md
 
 ## Connect the desktop to Titen
 
-Production builds default to `https://titen.nggalek.co`; local development defaults to `http://localhost:3000`. Open **Settings** to choose another server endpoint. Hosted endpoints must use HTTPS. Save settings, then click **Sign in with browser** and approve the displayed code. The desktop stores its device token in Keychain or Windows Credential Manager, scoped to that endpoint.
+Production builds default to `https://titen.nggalek.co`; local development defaults to `http://localhost:3000`. Open **Settings** to choose another server endpoint. Hosted endpoints must use HTTPS. Save settings, then click **Sign in with browser** and approve the displayed code. The desktop stores its device token in Keychain, Windows Credential Manager, or the Linux Secret Service, scoped to that endpoint.
 
 Start a meeting as usual. Titen reserves account credit before capture, sends 16 kHz mono audio directly to Soniox, and saves finalized transcript segments locally. The backend retains the long-lived Soniox key and issues a single-use temporary key for each recording session. It reconciles charges from provider usage records. Unused reserved credit remains held until reconciliation. Open **Open billing** or **Google settings** in the browser to manage account credit and Google access.
 
@@ -96,6 +124,8 @@ The `server_endpoint` setting is stored in the local `settings.json` file. Devic
 
 On Windows, enable desktop microphone access in Windows Settings under Privacy & security > Microphone. System audio uses the default playback endpoint.
 
+On Linux, the app is not sandboxed, so PipeWire or PulseAudio applies the user's device permissions directly. Playback capture uses the default sink's monitor; select the microphone in **Settings**.
+
 Approve microphone and Screen & System Audio Recording permission when macOS requests them. If access fails, open **System Settings > Privacy & Security**, grant access to Titen, and start again.
 
 The main window shows recording state, elapsed recording time, separate audio meters, finalized text, and partial speech. The live view retains the latest 500 finalized segments. Complete transcripts remain in **History**.
@@ -104,7 +134,7 @@ The main window shows recording state, elapsed recording time, separate audio me
 
 Closing the window hides it. Recording continues. The menu bar provides start, pause, resume, stop, open, and quit actions. Quit ends capture and allows up to 15 seconds for final transcription before leaving.
 
-Pause terminates capture. To change microphones, pause, open **Settings**, refresh the microphone list, choose a device, save, and resume. Source modes support both inputs, microphone only, and system audio only. On macOS, microphone-only mode uses AVFoundation and requires microphone permission only. Windows uses WASAPI.
+Pause terminates capture. To change microphones, pause, open **Settings**, refresh the microphone list, choose a device, save, and resume. Source modes support both inputs, microphone only, and system audio only. On macOS, microphone-only mode uses AVFoundation and requires microphone permission only. Windows uses WASAPI. Linux uses the selected PulseAudio source and the default monitor.
 
 In **Settings**, click **Test microphone for 10 seconds** to check the selected input before recording. The live test meter shows microphone input only. **Stop microphone test** ends it early. This test creates no meeting, writes no audio file, and makes no Soniox or Google request. It requires microphone access only.
 
@@ -114,7 +144,7 @@ Use headphones to reduce playback leakage into the microphone. Titen does not pr
 
 Open **History**, search meeting titles or transcript text, and select a meeting. Use **Copy transcript** or **Open Titen meeting** to view the server copy and Google Docs.
 
-Data lives in `~/Library/Application Support/Titen/` on macOS and `%AppData%\Titen\` on Windows. SQLite contains local meetings, speaker and timestamp metadata, and finalized segments. The settings file contains the endpoint and audio preferences. Back up the whole directory while Titen is stopped if you need a consistent manual copy. Device credentials are separate from that directory.
+Data lives in `~/Library/Application Support/Titen/` on macOS, `%AppData%\Titen\` on Windows, and `~/.config/Titen/` on Linux. SQLite contains local meetings, speaker and timestamp metadata, and finalized segments. The settings file contains the endpoint and audio preferences. Back up the whole directory while Titen is stopped if you need a consistent manual copy. Device credentials are separate from that directory.
 
 ## Understand recovery limits
 
@@ -143,10 +173,12 @@ See [architecture](docs/architecture.md), [verification results](docs/verificati
 
 - Startup checks inspect the selected audio mode and account access. Recording and resume stay disabled until those checks pass. Use **Request access** to show macOS permission prompts, then **Recheck** after changing permissions. Settings, logs, and stop controls remain available.
 - Local macOS builds create and reuse the persistent self-signed identity automatically. If the certificate is missing from the login keychain, run `sh scripts/sign-cert.sh`; do not delete the signing files under `~/Library/Application Support/Titen/Signing/` or the passphrase item in the login Keychain, or replace the certificate used by GitHub Actions. A change of signer can require granting TCC permissions again.
-- In **Settings → Open logs**, locate `titen.log` and attach it when reporting a problem. Logs persist across app restarts in the Titen config directory (`~/Library/Application Support/Titen/logs/` on macOS). Each line is a JSON event written with Go's `log/slog`, including timestamps and audio helper failure details. Audio samples and transcript content are not logged.
+- In **Settings → Open logs**, locate `titen.log` and attach it when reporting a problem. Logs persist across app restarts in the Titen config directory (`~/Library/Application Support/Titen/logs/` on macOS, `~/.config/Titen/logs/` on Linux). Each line is a JSON event written with Go's `log/slog`, including timestamps and audio helper failure details. Audio samples and transcript content are not logged.
 - If the helper cannot start, rebuild the bundle and check its path in **Settings**.
 - If either meter stays at zero, check permission, source mode, microphone selection, and whether the meeting is producing playback audio.
 - If Keychain access fails, approve access for the locally signed app. Rebuilding with a different signing identity can change Keychain authorization behavior.
+- If Linux sign-in reports that the Secret Service is unavailable, start GNOME Keyring or KWallet, install `libsecret-1-0`, and unlock the login keyring.
+- If the Linux helper reports that `pactl` or `parec` is missing, install `pulseaudio-utils` and confirm `pactl info` reaches the running server.
 - If a build reports a module-cache permission error, use the build script. It places Go, Swift, and Clang caches in the writable project cache directory.
 - If a transcript is incomplete after an outage, inspect the visible error before starting another session. Unfinalized audio cannot be reconstructed from finalized text.
 

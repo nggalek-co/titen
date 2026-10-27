@@ -7,7 +7,7 @@ import (
 )
 
 func TestHelperPaths(t *testing.T) {
-	for _, target := range []string{"darwin", "windows"} {
+	for _, target := range []string{"darwin", "windows", "linux"} {
 		t.Run(target, func(t *testing.T) {
 			root := t.TempDir()
 			exe := filepath.Join(root, "app", "titen")
@@ -20,10 +20,13 @@ func TestHelperPaths(t *testing.T) {
 				t.Fatalf("missing helper path %s", got)
 			}
 			var dev string
-			if target == "darwin" {
+			switch target {
+			case "darwin":
 				dev = filepath.Join(root, "native", "macos", ".build", "release", name)
-			} else {
+			case "windows":
 				dev = filepath.Join(root, "build", "windows-audio", "Release", name)
+			case "linux":
+				dev = filepath.Join(root, "build", "linux", name)
 			}
 			if err := os.MkdirAll(filepath.Dir(dev), 0700); err != nil {
 				t.Fatal(err)

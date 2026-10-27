@@ -32,9 +32,11 @@ jobs:
           - runner: windows-2025
             target: windows-amd64
             arch: amd64
+          - runner: ubuntu-24.04
+            target: linux-amd64
+            arch: amd64
     env:
       TITEN_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
-      TITEN_TEST_CREDENTIALS: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
@@ -55,6 +57,7 @@ jobs:
         shell: pwsh
         env:
           CGO_ENABLED: '0'
+          TITEN_TEST_CREDENTIALS: '1'
         run: |
           go test ./...
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -62,6 +65,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go run github.com/egoist/mygo/cmd/mygo vet .
           exit $LASTEXITCODE
+      - name: Test and vet Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sh scripts/verify.sh
       - name: Verify consecutive Windows installer upgrades
         if: runner.os == 'Windows'
         shell: pwsh
@@ -127,6 +134,10 @@ jobs:
         env:
           MYGO_UPDATER_PRIVATE_KEY: ${{ github.ref_type == 'tag' && secrets.MYGO_UPDATER_PRIVATE_KEY || '' }}
         run: ./scripts/build-windows.ps1
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sh scripts/build-linux.sh
       - name: Validate packaged binaries
         shell: bash
         env:
@@ -138,6 +149,7 @@ jobs:
           name: Titen-${{ matrix.target }}
           path: |
             dist/*.zip
+            dist/*.tar.gz
             dist/*.sha256
             dist/windows-amd64/Titen Setup *.exe
             dist/windows-amd64/Titen Setup *.exe.sha256
