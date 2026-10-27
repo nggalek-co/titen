@@ -92,7 +92,7 @@ type desktop struct {
 	liveList                               ui.ListState
 	root                                   context.Context
 	cancel                                 context.CancelFunc
-	busy, quitting                         bool
+	busy, quitting, quitRequested          bool
 	microphoneTesting                      bool
 	microphoneTestLevel                    float64
 	microphoneTestStatus                   string
@@ -1218,20 +1218,22 @@ func (d *desktop) ready() {
 			return
 		}
 		e.PreventDefault()
-		if d.busy {
-			d.message = locales.T("waitBeforeQuit")
-			d.win.Show()
+		if d.quitRequested {
 			return
 		}
-		d.busy = true
+		d.quitRequested = true
 		if d.microphoneTestCancel != nil {
 			d.microphoneTestCancel()
 		}
-		go func() {
-			_ = d.service.Stop(context.Background())
-			d.cancel()
-			d.win.Update(func() { d.quitting = true; mygo.App.Quit() })
-		}()
+		if d.busy {
+			d.message = locales.T("waitBeforeQuit")
+			d.win.Show()
+		}
+		d.busy = true
+		d.cancel()
+		go d.drainAndQuit()
+		// A wedged main thread cannot run the posted quit either.
+		time.AfterFunc(30*time.Second, func() { os.Exit(0) })
 	})
 	mygo.App.OnWillQuit(func(*mygo.QuitEvent) {
 		if d.tray != nil {
@@ -1239,6 +1241,25 @@ func (d *desktop) ready() {
 		}
 		d.cancel()
 	})
+}
+
+const quitDrainTimeout = 15 * time.Second
+
+// drainAndQuit stops background work and the meeting, then re-invokes the
+// quit the listener prevented. A task wedged in an uncancellable call gets
+// at most quitDrainTimeout before quit proceeds anyway.
+func (d *desktop) drainAndQuit() {
+	drained := make(chan struct{})
+	go func() {
+		d.tasks.Wait()
+		_ = d.service.Stop(context.Background())
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(quitDrainTimeout):
+	}
+	d.win.Update(func() { d.quitting = true; mygo.App.Quit() })
 }
 
 //go:embed resources/icon.png
