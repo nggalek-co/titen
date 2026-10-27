@@ -11,7 +11,8 @@ go build -o build/linux/titen-audio ./native/linux
 ```
 
 The helper is pure Go and builds with `CGO_ENABLED=0`. It needs `pactl` and
-`parec` from `pulseaudio-utils` at runtime.
+`parec` from `pulseaudio-utils` at runtime. The Debian package and portable
+archive place `titen-audio` beside the app executable.
 
 ## Command contract
 

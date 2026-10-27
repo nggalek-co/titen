@@ -22,7 +22,11 @@ Windows installers and executables remain unsigned; SmartScreen may warn, and th
 
 `sh scripts/verify.sh` passed the race suite, `go vet ./...`, and MyGo UI vet on Linux Mint 22.3 (Ubuntu 24.04 derivative, PipeWire 1.0.5 through PulseAudio compatibility). The new `native/linux` package tests framing against `internal/audio.ReadFrame`, monitor filtering, and the helper self-test. `cmd/packagecheck` tests cover a Linux archive with a missing helper.
 
-`sh scripts/build-linux.sh` built the app and helper with `CGO_ENABLED=0`, ran `titen-audio --self-test`, staged `build/linux-amd64/Titen`, and wrote `dist/Titen-dev-linux-amd64.tar.gz` with a SHA256 file. `go run ./cmd/packagecheck -dir dist -os Linux -arch amd64` verified the archive, both ELF AMD64 binaries, executable permissions, and the checksum.
+`sh scripts/build-linux.sh` built the app and helper with `CGO_ENABLED=0`, ran `titen-audio --self-test`, staged `build/linux-amd64/Titen`, and wrote `dist/Titen-dev-linux-amd64.tar.gz` and `dist/linux-amd64/titen_0.0.0_amd64.deb`, each with a SHA256 file. `go run ./cmd/packagecheck -dir dist -os Linux -arch amd64` verified the archive, both ELF AMD64 binaries, executable permissions, the checksums, the Debian control fields, the declared runtime dependencies, the app and helper payload, and the desktop entry.
+
+`dpkg-deb --info` showed `Package: titen`, `Architecture: amd64`, and `Depends: libgtk-3-0 | libgtk-3-0t64, pulseaudio-utils, libsecret-1-0`, with no WebKitGTK. `dpkg-deb --contents` showed `/opt/titen/titen`, `/opt/titen/titen-audio`, the desktop entry, and the `/usr/bin/titen` symlink. Extracting the package with `dpkg-deb -x` and launching the extracted app reported a passing audio startup check and three microphones.
+
+The MyGo build ran without a display because the script hides the root `package.json`, which MyGo otherwise treats as a web frontend and runs the app to generate bindings.
 
 `titen-audio --list-devices` returned three microphone sources and omitted every `.monitor` source. With `TITEN_TEST_CREDENTIALS=1`, the Secret Service roundtrip and missing-key tests passed against the running keyring.
 
@@ -32,4 +36,4 @@ The packaged app launched from `build/linux-amd64/Titen`. Its log reported `audi
 
 ### Linux unverified boundaries
 
-Live capture was not assessed: the short fallback capture above was discarded, and simultaneous sources, the selected device, default-sink changes, headphones, long meetings, and provider access were not exercised. The helper derives timestamps from a shared sample clock rather than server presentation time. The app captures only the default sink's monitor and does not follow a later default-sink change. The Ubuntu CI job has not run yet. Stock Ubuntu desktop runtime packages, non-GNOME Secret Service providers, and Linux ARM64 packaging remain untested.
+Live capture was not assessed: the short fallback capture above was discarded, and simultaneous sources, the selected device, default-sink changes, headphones, long meetings, and provider access were not exercised. The helper derives timestamps from a shared sample clock rather than server presentation time. The app captures only the default sink's monitor and does not follow a later default-sink change. The Ubuntu CI job has not run yet. Stock Ubuntu desktop runtime packages, non-GNOME Secret Service providers, and Linux ARM64 packaging remain untested. Installing the Debian package with `apt` on a clean system, signing the package, and updating it from an apt repository were not exercised.

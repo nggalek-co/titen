@@ -39,6 +39,12 @@ func TestRejectPackageMissingCaptureHelper(t *testing.T) {
 	}
 }
 
+func TestReadArRejectsInvalidArchive(t *testing.T) {
+	if _, err := readAr([]byte("not a Debian package")); err == nil {
+		t.Fatal("invalid Debian archive accepted")
+	}
+}
+
 func TestRejectLinuxPackageMissingCaptureHelper(t *testing.T) {
 	var data bytes.Buffer
 	compressed := gzip.NewWriter(&data)

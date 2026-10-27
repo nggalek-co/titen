@@ -9,11 +9,13 @@ import (
 	"debug/elf"
 	"debug/macho"
 	"debug/pe"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -129,6 +131,108 @@ func checkBinary(target, arch, name string, e entry) error {
 	return nil
 }
 
+func readAr(data []byte) (map[string][]byte, error) {
+	if len(data) < 8 || string(data[:8]) != "!<arch>\n" {
+		return nil, errors.New("not a Debian package")
+	}
+	entries := make(map[string][]byte)
+	for offset := 8; offset+60 <= len(data); {
+		header := data[offset : offset+60]
+		if string(header[58:60]) != "`\n" {
+			return nil, errors.New("invalid Debian package entry")
+		}
+		name := strings.TrimSuffix(strings.TrimSpace(string(header[:16])), "/")
+		size, err := strconv.Atoi(strings.TrimSpace(string(header[48:58])))
+		if err != nil || size < 0 {
+			return nil, fmt.Errorf("invalid Debian package entry %q", name)
+		}
+		start := offset + 60
+		end := start + size
+		if end > len(data) {
+			return nil, fmt.Errorf("truncated Debian package entry %q", name)
+		}
+		entries[name] = data[start:end]
+		offset = end
+		if size%2 == 1 {
+			offset++
+		}
+	}
+	return entries, nil
+}
+
+func verifyChecksum(path string, data, checksum []byte) error {
+	fields := strings.Fields(string(checksum))
+	digest := fmt.Sprintf("%x", sha256.Sum256(data))
+	if len(fields) != 2 || fields[0] != digest || fields[1] != filepath.Base(path) {
+		return fmt.Errorf("checksum does not match %s", path)
+	}
+	return nil
+}
+
+func checkDeb(directory, arch string) error {
+	debs, err := filepath.Glob(filepath.Join(directory, "linux-"+arch, "titen_*_"+arch+".deb"))
+	if err != nil {
+		return err
+	}
+	if len(debs) != 1 {
+		return fmt.Errorf("expected one Linux/%s Debian package, found %d", arch, len(debs))
+	}
+	deb := debs[0]
+	data, err := os.ReadFile(deb)
+	if err != nil {
+		return err
+	}
+	checksum, err := os.ReadFile(deb + ".sha256")
+	if err != nil {
+		return err
+	}
+	if err := verifyChecksum(deb, data, checksum); err != nil {
+		return err
+	}
+	archive, err := readAr(data)
+	if err != nil {
+		return err
+	}
+	controlArchive, err := readTarGz(archive["control.tar.gz"])
+	if err != nil {
+		return fmt.Errorf("read Debian control archive: %w", err)
+	}
+	controlEntry, ok := controlArchive["./control"]
+	if !ok {
+		controlEntry, ok = controlArchive["control"]
+	}
+	if !ok {
+		return fmt.Errorf("Debian package has no control file")
+	}
+	control := string(controlEntry.data)
+	for _, want := range []string{"Package: titen\n", "Architecture: " + arch + "\n", "pulseaudio-utils", "libsecret-1-0"} {
+		if !strings.Contains(control, want) {
+			return fmt.Errorf("Debian package control is missing %q", strings.TrimSpace(want))
+		}
+	}
+	if strings.Contains(control, "libwebkit2gtk") {
+		return fmt.Errorf("Debian package declares an unused WebKitGTK dependency")
+	}
+	dataArchive, err := readTarGz(archive["data.tar.gz"])
+	if err != nil {
+		return fmt.Errorf("read Debian data archive: %w", err)
+	}
+	for _, name := range []string{"./opt/titen/titen", "./opt/titen/titen-audio"} {
+		e, ok := dataArchive[name]
+		if !ok {
+			return fmt.Errorf("Debian package is missing %s", name)
+		}
+		if err := checkBinary("Linux", arch, name, e); err != nil {
+			return err
+		}
+	}
+	if _, ok := dataArchive["./usr/share/applications/titen.desktop"]; !ok {
+		return fmt.Errorf("Debian package is missing the desktop entry")
+	}
+	fmt.Printf("Verified %s with app, helper, desktop entry, and matching SHA256\n", deb)
+	return nil
+}
+
 func check(directory, target, arch string) error {
 	var suffix, pattern string
 	var executables []string
@@ -165,10 +269,8 @@ func check(directory, target, arch string) error {
 	if err != nil {
 		return err
 	}
-	fields := strings.Fields(string(checksum))
-	digest := fmt.Sprintf("%x", sha256.Sum256(data))
-	if len(fields) != 2 || fields[0] != digest || fields[1] != filepath.Base(archive) {
-		return fmt.Errorf("checksum does not match %s", archive)
+	if err := verifyChecksum(archive, data, checksum); err != nil {
+		return err
 	}
 	var entries map[string]entry
 	if target == "Linux" {
@@ -192,6 +294,11 @@ func check(directory, target, arch string) error {
 	for _, name := range executables {
 		e := entries[name]
 		if err := checkBinary(target, arch, name, e); err != nil {
+			return err
+		}
+	}
+	if target == "Linux" {
+		if err := checkDeb(directory, arch); err != nil {
 			return err
 		}
 	}

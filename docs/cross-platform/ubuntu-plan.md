@@ -2,7 +2,7 @@
 
 ## Done predicate
 
-- `scripts/build-linux.sh` creates a runnable Linux AMD64 app folder and checksum archive under `build/` and `dist/`.
+- `scripts/build-linux.sh` creates a runnable Linux AMD64 app folder, a checksum archive, and a Debian package under `build/` and `dist/`.
 - The packaged app launches on the current Ubuntu-based desktop and its startup check finds the packaged audio helper.
 - The helper lists PulseAudio-compatible microphone sources and can select the default playback monitor while keeping the existing `TIT1` frame format.
 - Linux credentials use the desktop Secret Service. The app does not write access tokens to its settings file.
@@ -23,6 +23,7 @@ The host is an Ubuntu 24.04 derivative, not stock Ubuntu. The build and desktop 
   - [x] Add a Linux helper that lists sources and emits the existing `TIT1` frames from PulseAudio-compatible input streams.
   - [x] Add Linux Secret Service storage and a focused user-facing error when its runtime is unavailable.
   - [x] Add a rerunnable Linux build and packaging script, then inspect the archive contents.
+  - [x] Add a Debian package with a desktop entry, a command, and declared runtime dependencies.
   - [x] Add the Ubuntu build gate and document installation and runtime requirements.
 - [x] Phase D. Keep the decision log current and review every entry against the run transcript.
 - [x] Phase E. Build and launch the packaged app on the desktop, check helper discovery, inspect the final diff, and report any hardware checks that remain open.
@@ -55,6 +56,14 @@ relies on exit codes. `mygo.Secrets` already wraps libsecret through purego,
 returns `errors.ErrUnsupported` when no store exists, and lets the store pin
 the `co.nggalek.titen` service used by macOS, Windows, and `mygo.json`.
 Choose `mygo.Secrets`.
+
+The Debian package comes from MyGo's Linux packager, which also writes the
+desktop entry, icon, and `/usr/bin/titen` command. MyGo declares WebKitGTK
+for every Linux app. Titen uses native UI, so the build removes that
+dependency and declares `pulseaudio-utils` and `libsecret-1-0` in
+`mygo.json`. The package is rebuilt with `dpkg-deb -Zgzip` so packagecheck
+can read its control and data archives without an external decoder. The
+portable tar.gz stays beside it for users who do not install packages.
 
 ## Architecture checklist
 

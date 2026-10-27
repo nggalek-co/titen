@@ -54,7 +54,16 @@ sh scripts/build-linux.sh
 ./build/linux-amd64/Titen/titen
 ```
 
-The build produces a portable archive in `dist` and stages the app at `build/linux-amd64/Titen`. Keep `titen` and `titen-audio` together; the app looks for the helper beside its executable. The archive is `Titen-<version>-linux-amd64.tar.gz` with a matching SHA256 file. There is no installer, desktop entry, or automatic update path yet.
+The build produces a Debian package at `dist/linux-amd64/titen_<version>_amd64.deb` and a portable archive at `dist/Titen-<version>-linux-amd64.tar.gz`, each with a matching SHA256 file. It stages the app at `build/linux-amd64/Titen`; keep `titen` and `titen-audio` together because the app looks for the helper beside its executable. Building needs `dpkg-deb` from dpkg to finalize the package.
+
+Install the Debian package:
+
+```sh
+sudo apt install ./dist/linux-amd64/titen_<version>_amd64.deb
+titen
+```
+
+The package installs the app under `/opt/titen`, adds the desktop entry and icon, and provides the `titen` command. It declares GTK 3, `pulseaudio-utils`, and `libsecret-1-0`. The portable archive runs without installation and keeps both executables together.
 
 The Linux runtime needs GTK 3 for the native UI, `pactl` and `parec` from `pulseaudio-utils`, and libsecret with a running Secret Service provider such as GNOME Keyring or KWallet. On Debian and Ubuntu:
 
@@ -72,6 +81,8 @@ The helper has a hardware-free protocol and source-filtering test.
 ./build/linux-amd64/Titen/titen-audio --self-test
 ```
 
+The Debian package is unsigned and is not published from an apt repository, so there is no automatic update path yet.
+
 ## GitHub builds on version tags
 
 The Desktop builds workflow runs native checks and packages pull requests, pushes to main, manual dispatches, and tags matching `v*`. A successful tag run also publishes a GitHub Release. For example, pushing `v1.2.3` builds that exact tagged source.
@@ -81,7 +92,7 @@ Each successful run uploads four downloadable GitHub Actions artifacts. The Wind
 - `Titen-macos-arm64` contains the Apple silicon app and Swift helper.
 - `Titen-macos-amd64` contains the Intel app and Swift helper.
 - `Titen-windows-amd64` contains the Windows application and WASAPI helper.
-- `Titen-linux-amd64` contains the Linux application and PulseAudio helper.
+- `Titen-linux-amd64` contains the Linux application, PulseAudio helper, portable archive, and Debian package.
 
 Download CI artifacts from the workflow run's Artifacts section. Version tags set the embedded application version and archive filenames. A failed platform build blocks publication of the release.
 

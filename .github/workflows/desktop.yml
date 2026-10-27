@@ -151,6 +151,8 @@ jobs:
             dist/*.zip
             dist/*.tar.gz
             dist/*.sha256
+            dist/linux-amd64/*.deb
+            dist/linux-amd64/*.deb.sha256
             dist/windows-amd64/Titen Setup *.exe
             dist/windows-amd64/Titen Setup *.exe.sha256
             dist/windows-amd64/*.tar.gz
