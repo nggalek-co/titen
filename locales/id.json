@@ -78,6 +78,7 @@
   "signedIn": "Sudah masuk",
   "signInToRecord": "Masuk untuk merekam",
   "signOut": "Keluar",
+  "signOutNotRevoked": "Keluar di perangkat ini, tetapi server tidak dapat mencabut sesi. {detail}",
   "approveCode": "Setujui kode: {code}",
   "openBilling": "Buka tagihan",
   "googleSettings": "Pengaturan Google",

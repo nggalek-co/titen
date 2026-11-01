@@ -78,6 +78,7 @@
   "signedIn": "Signed in",
   "signInToRecord": "Sign in to record",
   "signOut": "Sign out",
+  "signOutNotRevoked": "Signed out on this device, but the server could not revoke the session. {detail}",
   "approveCode": "Approve code: {code}",
   "openBilling": "Open billing",
   "googleSettings": "Google settings",

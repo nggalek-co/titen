@@ -57,6 +57,30 @@ func TestRecordViewPromptsSignIn(t *testing.T) {
 	}
 }
 
+func TestSettingsAlwaysOffersSignOut(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{"signed out", ""},
+		{"signed in", "token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &desktop{
+				settings:    app.Settings{CaptureMode: "Both", Language: "en"},
+				page:        "Settings",
+				snapshot:    app.Snapshot{State: app.Idle},
+				deviceToken: tc.token,
+				microphone:  "System default",
+			}
+			tt := ui.NewTester(testView(d), 1000, 760)
+			if !tt.HasText("Sign out") {
+				t.Fatalf("sign-out button missing from Settings: %v", tt.Texts())
+			}
+		})
+	}
+}
+
 func TestRecordViewSignedInShowsStart(t *testing.T) {
 	d := &desktop{
 		settings:    app.Settings{CaptureMode: "Both", Language: "en"},

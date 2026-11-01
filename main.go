@@ -204,18 +204,31 @@ func (d *desktop) connectAccount() {
 	})
 }
 
+// signOut revokes the device session on the server, then drops the token this
+// machine holds. A revocation that fails still signs out locally, and says so.
 func (d *desktop) signOut() {
 	if d.snapshot.State != app.Idle {
 		return
 	}
-	endpoint := d.settings.ServerEndpoint
+	endpoint, token := d.settings.ServerEndpoint, d.deviceToken
 	d.async(func() error {
+		var revokeErr error
+		if token != "" {
+			ctx, cancel := context.WithTimeout(d.root, 10*time.Second)
+			revokeErr = (&saas.Client{BaseURL: endpoint, Token: token}).Logout(ctx)
+			cancel()
+		}
+		var deleteErr error
 		if key := saas.TokenKey(endpoint); key != "" {
-			if err := auth.DeleteSecret(key); err != nil {
-				return err
-			}
+			deleteErr = auth.DeleteSecret(key)
 		}
 		d.win.Update(func() { d.deviceToken = ""; d.deviceCode = ""; d.probe() })
+		if deleteErr != nil {
+			return deleteErr
+		}
+		if revokeErr != nil {
+			return errors.New(locales.Tf("signOutNotRevoked", map[string]any{"detail": revokeErr.Error()}))
+		}
 		return nil
 	})
 }
@@ -1089,9 +1102,7 @@ func (d *desktop) settingsView(c *ui.Context) {
 				})
 				ui.Row(c).Gap(10).AlignItems(ui.Center).Wrap().Children(func() {
 					components.Button(c, d.tr(c, "signInBrowser"), components.ButtonSecondary).Disabled(d.busy || d.snapshot.State != app.Idle).OnClick(d.connectAccount)
-					if d.deviceToken != "" {
-						components.Button(c, d.tr(c, "signOut"), components.ButtonSecondary).Disabled(d.busy || d.snapshot.State != app.Idle).OnClick(d.signOut)
-					}
+					components.Button(c, d.tr(c, "signOut"), components.ButtonSecondary).Disabled(d.busy || d.snapshot.State != app.Idle || d.deviceToken == "").OnClick(d.signOut)
 					status := d.tr(c, "notSignedIn")
 					if d.deviceToken != "" {
 						status = d.tr(c, "signedIn")

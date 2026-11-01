@@ -246,6 +246,27 @@ func (c *Client) WaitDevice(ctx context.Context, code DeviceCode) (string, error
 	}
 }
 
+// Logout revokes this device's session on the server, so the token stops
+// working everywhere. A token the server already revoked answers 401, which
+// is the outcome Logout wants.
+func (c *Client) Logout(ctx context.Context) error {
+	var result struct {
+		LoggedOut bool `json:"loggedOut"`
+	}
+	status, err := c.request(ctx, http.MethodPost, "/api/device/logout", nil, &result, true)
+	if err != nil {
+		var api *APIError
+		if errors.As(err, &api) && (api.Status == http.StatusUnauthorized || api.Status == http.StatusForbidden) {
+			return nil
+		}
+		return err
+	}
+	if status != http.StatusOK || !result.LoggedOut {
+		return errors.New("Titen server returned an invalid logout response")
+	}
+	return nil
+}
+
 func (c *Client) Authorize(ctx context.Context, clientTag string) (Session, error) {
 	return c.authorize(ctx, clientTag, "")
 }

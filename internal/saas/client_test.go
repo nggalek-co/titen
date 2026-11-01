@@ -70,6 +70,44 @@ func TestDevicePendingThenApproval(t *testing.T) {
 	}
 }
 
+func TestLogoutRevokesTheToken(t *testing.T) {
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/device/logout" || r.Method != http.MethodPost {
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		w.Write([]byte(`{"loggedOut":true}`))
+	}))
+	defer server.Close()
+	if err := (&Client{BaseURL: server.URL, Token: "ttn_dev_test"}).Logout(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer ttn_dev_test" {
+		t.Fatalf("authorization = %q", gotAuth)
+	}
+}
+
+func TestLogoutAcceptsAnAlreadyRevokedToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"invalid device token"}`, http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	if err := (&Client{BaseURL: server.URL, Token: "stale"}).Logout(context.Background()); err != nil {
+		t.Fatalf("already revoked token = %v, want no error", err)
+	}
+}
+
+func TestLogoutReportsAnUnreachableServer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	if err := (&Client{BaseURL: server.URL, Token: "token"}).Logout(context.Background()); err == nil {
+		t.Fatal("a failed revocation was reported as success")
+	}
+}
+
 func TestDeviceCancel(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(202); w.Write([]byte(`{"pending":true}`)) }))
 	defer server.Close()
