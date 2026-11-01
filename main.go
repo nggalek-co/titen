@@ -35,6 +35,7 @@ import (
 	"titen/internal/storage"
 	"titen/internal/transcript"
 	"titen/internal/transcription"
+	"titen/internal/update"
 	"titen/locales"
 )
 
@@ -117,6 +118,8 @@ type desktop struct {
 	microphoneTestLevel                    float64
 	microphoneTestStatus                   string
 	microphoneTestCancel                   context.CancelFunc
+	update                                 *update.Release
+	updateOpen                             bool
 }
 
 func (d *desktop) async(work func() error) {
@@ -200,6 +203,7 @@ func (d *desktop) connectAccount() {
 		return nil
 	})
 }
+
 func (d *desktop) signOut() {
 	if d.snapshot.State != app.Idle {
 		return
@@ -690,6 +694,32 @@ func (d *desktop) view(c *ui.Context) {
 					components.Text(c, d.notice.text).FontSize(11).FontWeight(500).SingleLine()
 				})
 			}
+		})
+	})
+	if d.update != nil {
+		ui.Modal(c, &d.updateOpen, func() { d.updateDialog(c) })
+	}
+}
+
+// updateDialog offers the release the startup check found: the build for this
+// platform, or the release page when it has none.
+func (d *desktop) updateDialog(c *ui.Context) {
+	release := d.update
+	if release == nil {
+		return
+	}
+	t := c.Theme()
+	ui.Column(c).Width(380).Gap(10).Children(func() {
+		components.Text(c, d.tr(c, "updateTitle")).FontSize(16).FontWeight(600)
+		components.Text(c, d.trf(c, "updateBody", map[string]any{"version": release.Version, "current": currentVersion()})).FontSize(13).TextColor(t.TextMuted)
+		ui.Row(c).Gap(8).Justify(ui.End).Children(func() {
+			components.Button(c, d.tr(c, "updateLater"), components.ButtonSecondary).OnClick(func() { d.updateOpen = false })
+			components.Button(c, d.tr(c, "updateDownload"), components.ButtonPrimary).OnClick(func() {
+				d.updateOpen = false
+				if err := mygo.Shell.OpenExternal(release.URL(runtime.GOOS, runtime.GOARCH)); err != nil {
+					d.fail(err)
+				}
+			})
 		})
 	})
 }
@@ -1228,6 +1258,7 @@ func (d *desktop) ready() {
 	}
 	d.probe()
 	d.refreshDevices()
+	d.checkUpdateOnStart()
 	d.tasks.Add(1)
 	go func() {
 		defer d.tasks.Done()
@@ -1347,6 +1378,34 @@ func currentVersion() string {
 		return packaged
 	}
 	return version
+}
+
+// checkUpdateOnStart asks the web app which release is current and opens the
+// update dialog when this build is behind it. Builds that install their own
+// updates, as the signed Windows installer does, keep their own prompt.
+func (d *desktop) checkUpdateOnStart() {
+	endpoint := d.settings.ServerEndpoint
+	d.tasks.Add(1)
+	go func() {
+		defer d.tasks.Done()
+		if mygo.Updater.Enabled() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(d.root, 20*time.Second)
+		defer cancel()
+		release, err := update.Fetch(ctx, endpoint)
+		if err != nil {
+			slog.Warn("update check", "error", err)
+			return
+		}
+		if !update.Newer(currentVersion(), release.Version) {
+			return
+		}
+		d.win.Update(func() {
+			d.update = release
+			d.updateOpen = true
+		})
+	}()
 }
 
 func defaultServerEndpoint() string {

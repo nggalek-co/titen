@@ -12,6 +12,7 @@ import (
 	"titen/internal/saas"
 	"titen/internal/storage"
 	"titen/internal/transcript"
+	"titen/internal/update"
 	"titen/locales"
 )
 
@@ -115,6 +116,34 @@ func TestNativeScreens(t *testing.T) {
 	tt.Frame()
 	if !tt.HasText("Live transcript") {
 		t.Fatal("dark mode record screen missing")
+	}
+}
+
+func TestUpdateDialogOffersTheDownload(t *testing.T) {
+	d := &desktop{
+		settings:   app.Settings{ServerEndpoint: "http://localhost:3000", CaptureMode: "Both", Language: "en"},
+		page:       "Record",
+		snapshot:   app.Snapshot{State: app.Idle},
+		microphone: "System default",
+		updateOpen: true,
+		update: &update.Release{
+			Tag:        "v0.0.9",
+			Version:    "0.0.9",
+			Name:       "Titen 0.0.9",
+			ReleaseURL: "https://example.test/releases/v0.0.9",
+			Downloads:  []update.Download{{Platform: "macos", Arch: "arm64", Format: "zip", URL: "https://example.test/titen.zip"}},
+		},
+	}
+	tt := ui.NewTester(testView(d), 1000, 760)
+	if !tt.HasText("Update available") || !tt.HasText("Download update") || !tt.HasText("Titen 0.0.9 is available") {
+		t.Fatalf("update dialog missing: %v", tt.Texts())
+	}
+	saveScreenPNG(t, "docs/screenshots/native-update.png", tt)
+	if err := tt.Click("Later"); err != nil {
+		t.Fatal(err)
+	}
+	if d.updateOpen {
+		t.Fatal("Later left the dialog open")
 	}
 }
 

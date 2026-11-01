@@ -117,5 +117,9 @@
   "tipPrefix": "Titen · {state}",
   "tipMicTest": "Titen · Tes mikrofon aktif",
   "retainFullAudio": "Simpan audio untuk transkripsi nanti",
-  "retainFullAudioHint": "Menyimpan audio rapat di perangkat ini dan mengunggahnya hanya saat transkripsi langsung tidak tersedia atau rapat disimpan untuk nanti."
+  "retainFullAudioHint": "Menyimpan audio rapat di perangkat ini dan mengunggahnya hanya saat transkripsi langsung tidak tersedia atau rapat disimpan untuk nanti.",
+  "updateTitle": "Pembaruan tersedia",
+  "updateBody": "Titen {version} sudah tersedia. Anda memakai {current}.",
+  "updateDownload": "Unduh pembaruan",
+  "updateLater": "Nanti"
 }
