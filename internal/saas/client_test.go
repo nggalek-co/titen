@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -149,6 +150,116 @@ func TestAuthorizeRejectsForeignStream(t *testing.T) {
 
 func directSession() Session {
 	return Session{SessionID: "s", MeetingID: "m", ReservationID: "r", WSURL: "wss://stt-rt.soniox.com/transcribe-websocket", TemporaryAPIKey: "temporary-secret", ExpiresAt: time.Now().Add(time.Minute), MaxSessionDurationSeconds: 600, Model: "stt-rt-v5"}
+}
+
+func TestAuthorizeTranscriptionConfigCompatibility(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		includeConfig    bool
+		wantConfigAbsent bool
+	}{
+		{name: "older server omits config", wantConfigAbsent: true},
+		{name: "new server may send an empty config", includeConfig: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				response := map[string]any{
+					"sessionId": "s", "meetingId": "m", "reservationId": "r",
+					"wsUrl":           "wss://stt-rt.soniox.com/transcribe-websocket",
+					"temporaryApiKey": "temporary-secret", "expiresAt": time.Now().Add(time.Minute),
+					"maxSessionDurationSeconds": 600, "model": "stt-rt-v5",
+				}
+				if test.includeConfig {
+					response["transcriptionConfig"] = map[string]any{
+						"languageHints": []string{}, "vocabularyTerms": []string{},
+					}
+				}
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer server.Close()
+			session, err := (&Client{BaseURL: server.URL, Token: "device-secret"}).Authorize(context.Background(), "tag")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.wantConfigAbsent && session.TranscriptionConfig != nil {
+				t.Fatalf("older response config=%+v", session.TranscriptionConfig)
+			}
+			if test.includeConfig && (session.TranscriptionConfig == nil || len(session.TranscriptionConfig.LanguageHints) != 0) {
+				t.Fatalf("empty response config=%+v", session.TranscriptionConfig)
+			}
+		})
+	}
+}
+
+func TestStreamUsesTranscriptionConfig(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		config       *TranscriptionConfig
+		wantHints    []any
+		wantTerms    []any
+		wantHintKey  bool
+		wantTermsKey bool
+	}{
+		{name: "older server keeps defaults", wantHints: []any{"id", "en"}, wantHintKey: true},
+		{
+			name: "saved language hints and terms",
+			config: &TranscriptionConfig{
+				LanguageHints: []string{"id", "ms"}, VocabularyTerms: []string{"Nggalek", "KiAI SENTOT"},
+			},
+			wantHints: []any{"id", "ms"}, wantTerms: []any{"Nggalek", "KiAI SENTOT"},
+			wantHintKey: true, wantTermsKey: true,
+		},
+		{
+			name:   "present empty config enables auto detection",
+			config: &TranscriptionConfig{LanguageHints: []string{}, VocabularyTerms: []string{}},
+		},
+		{
+			name:      "empty language list still sends terms",
+			config:    &TranscriptionConfig{LanguageHints: []string{}, VocabularyTerms: []string{"Nggalek"}},
+			wantTerms: []any{"Nggalek"}, wantTermsKey: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			startConfig := make(chan map[string]any, 1)
+			client := directTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer conn.Close()
+				var config map[string]any
+				if err := conn.ReadJSON(&config); err != nil {
+					t.Error(err)
+					return
+				}
+				startConfig <- config
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"tokens":[],"finished":true}`))
+			}, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/transcription-sessions/s/end" {
+					t.Errorf("unexpected backend path %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})
+			session := directSession()
+			session.TranscriptionConfig = test.config
+			if err := client.Stream(context.Background(), session, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			config := <-startConfig
+			if got, ok := config["language_hints"]; ok != test.wantHintKey || (ok && !reflect.DeepEqual(got, test.wantHints)) {
+				t.Errorf("language_hints=%v present=%v", got, ok)
+			}
+			contextValue, hasContext := config["context"].(map[string]any)
+			if hasContext != test.wantTermsKey {
+				t.Errorf("context=%v present=%v", config["context"], hasContext)
+			} else if hasContext && !reflect.DeepEqual(contextValue["terms"], test.wantTerms) {
+				t.Errorf("context.terms=%v", contextValue["terms"])
+			}
+		})
+	}
 }
 
 type testTransport func(*http.Request) (*http.Response, error)

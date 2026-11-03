@@ -41,15 +41,23 @@ type DeviceCode struct {
 }
 
 type Session struct {
-	SessionID                 string    `json:"sessionId"`
-	MeetingID                 string    `json:"meetingId"`
-	ReservationID             string    `json:"reservationId"`
-	WSURL                     string    `json:"wsUrl"`
-	RateUnitsPerHour          int       `json:"rateUnitsPerHour"`
-	TemporaryAPIKey           string    `json:"temporaryApiKey"`
-	ExpiresAt                 time.Time `json:"expiresAt"`
-	MaxSessionDurationSeconds int       `json:"maxSessionDurationSeconds"`
-	Model                     string    `json:"model"`
+	SessionID                 string               `json:"sessionId"`
+	MeetingID                 string               `json:"meetingId"`
+	ReservationID             string               `json:"reservationId"`
+	WSURL                     string               `json:"wsUrl"`
+	RateUnitsPerHour          int                  `json:"rateUnitsPerHour"`
+	TemporaryAPIKey           string               `json:"temporaryApiKey"`
+	ExpiresAt                 time.Time            `json:"expiresAt"`
+	MaxSessionDurationSeconds int                  `json:"maxSessionDurationSeconds"`
+	Model                     string               `json:"model"`
+	TranscriptionConfig       *TranscriptionConfig `json:"transcriptionConfig,omitempty"`
+}
+
+// TranscriptionConfig carries account preferences for the Soniox WebSocket.
+// A nil pointer means the server predates this response field.
+type TranscriptionConfig struct {
+	LanguageHints   []string `json:"languageHints"`
+	VocabularyTerms []string `json:"vocabularyTerms"`
 }
 
 // Budget mirrors GET /api/heartbeat: the device's remaining transcription

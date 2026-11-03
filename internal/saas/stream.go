@@ -350,11 +350,24 @@ func (c *Client) streamGrant(ctx context.Context, session Session, audio <-chan 
 	defer conn.Close()
 	conn.SetReadLimit(4 << 20)
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := conn.WriteJSON(map[string]any{
+	startMessage := map[string]any{
 		"model": session.Model, "audio_format": "pcm_s16le", "sample_rate": 16000,
-		"num_channels": 1, "language_hints": []string{"id", "en"},
+		"num_channels":               1,
 		"enable_speaker_diarization": true, "enable_endpoint_detection": true,
-	}); err != nil {
+	}
+	if session.TranscriptionConfig == nil {
+		// Older backends do not return transcriptionConfig. Keep their existing
+		// Indonesian and English behavior until the backend is upgraded.
+		startMessage["language_hints"] = []string{"id", "en"}
+	} else {
+		if len(session.TranscriptionConfig.LanguageHints) > 0 {
+			startMessage["language_hints"] = session.TranscriptionConfig.LanguageHints
+		}
+		if len(session.TranscriptionConfig.VocabularyTerms) > 0 {
+			startMessage["context"] = map[string]any{"terms": session.TranscriptionConfig.VocabularyTerms}
+		}
+	}
+	if err := conn.WriteJSON(startMessage); err != nil {
 		return nil, providerInterrupted("Soniox stream configuration failed")
 	}
 	if notify != nil {
