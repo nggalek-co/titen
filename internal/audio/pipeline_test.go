@@ -69,7 +69,7 @@ func TestTimestampAlignmentAndClipping(t *testing.T) {
 		t.Fatalf("got %d chunks", len(chunks))
 	}
 	sample := func(c, i int) int16 { return int16(binary.LittleEndian.Uint16(chunks[c].PCM[i*2:])) }
-	if sample(0, 0) != 15000 || sample(0, 200) != 30000 || sample(1, 0) != 15000 {
+	if sample(0, 0) != 30000 || sample(0, 200) != 32767 || sample(1, 0) != 30000 {
 		t.Fatal("timestamps not aligned")
 	}
 	if chunks[0].Timestamp != time.Second {
@@ -88,5 +88,11 @@ func TestLargeTimestamp(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMeterLevelShowsQuietSpeech(t *testing.T) {
+	if MeterLevel(0) != 0 || MeterLevel(1) != 1 || math.Abs(MeterLevel(.01)-1.0/3) > .001 {
+		t.Fatal("invalid dB meter")
 	}
 }

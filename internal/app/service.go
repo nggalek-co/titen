@@ -144,6 +144,10 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 		if s.capture != nil {
 			s.endCapture()
 		}
+		if s.recorder != nil {
+			s.recorder.Close()
+			s.recorder = nil
+		}
 		close(chunks)
 		cancel()
 		s.failIncomplete(cause)
@@ -152,16 +156,19 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 		s.setIdle()
 		return errors.Join(cause, markErr, finishErr)
 	}
-	// Opt-in full-audio retention: recording starts with the first captured
-	// sample, before any grant, so audio survives a failed authorization.
-	if cfg.RetainFullAudio && s.RecordingsDir != "" {
+	// Save local audio before authorization so a network failure cannot lose it.
+	if s.RecordingsDir != "" {
 		recorder, err := transcription.NewRecorder(
 			filepath.Join(s.RecordingsDir, meeting.ID), meeting.ID, audioRecordingLimitBytes,
 			func(meta transcription.ChunkMeta) {
+				state := "archived"
+				if cfg.RetainFullAudio {
+					state = "local_ready"
+				}
 				_ = s.Store.AddAudioChunk(context.Background(), storage.AudioChunk{
 					ID: meta.ID, MeetingID: meta.MeetingID, Index: meta.Index,
 					StartMS: meta.StartMS, DurationMS: meta.DurationMS, Checksum: meta.Checksum,
-					Path: meta.Path, SizeBytes: meta.SizeBytes, State: "local_ready",
+					Path: meta.Path, SizeBytes: meta.SizeBytes, State: state,
 				})
 			},
 			func(err error) { s.failIncomplete(err) },
@@ -190,7 +197,7 @@ func (s *Service) Start(ctx context.Context, cfg Settings, key, title string) er
 			capacity := errors.As(err, &apiErr) && (apiErr.Status == 429 || apiErr.Status == 503)
 			// When capacity is full and the user opted in, keep recording
 			// for a delayed transcript instead of losing the meeting.
-			if !(capacity && s.recorder != nil) {
+			if !(capacity && cfg.RetainFullAudio && s.recorder != nil) {
 				return finishFailedStart(err)
 			}
 			s.needsRecovery = true
@@ -550,7 +557,7 @@ func (s *Service) stop(ctx context.Context) error {
 	s.mu.Lock()
 	incomplete := s.incomplete || s.needsRecovery
 	s.mu.Unlock()
-	s.retainOrUpload(context.Background(), snap.MeetingID, incomplete)
+	s.retainOrUpload(context.Background(), snap.MeetingID, incomplete && s.settings.RetainFullAudio)
 	if incomplete {
 		if err := s.Store.MarkMeetingInterrupted(context.Background(), snap.MeetingID); err != nil {
 			s.fail(fmt.Errorf("mark interrupted meeting: %w", err))

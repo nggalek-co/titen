@@ -16,9 +16,7 @@ type Settings struct {
 	CaptureMode          string `json:"capture_mode"`
 	HelperPath           string `json:"helper_path"`
 	Language             string `json:"language"`
-	// RetainFullAudio is opt-in: when on, the app keeps meeting audio
-	// locally and uploads it for delayed transcription when live
-	// transcription is unavailable.
+	// RetainFullAudio enables recovery uploads. Local recording is always on.
 	RetainFullAudio bool `json:"retain_full_audio,omitempty"`
 }
 

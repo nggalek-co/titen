@@ -4,16 +4,12 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"path/filepath"
 
 	"titen/internal/saas"
 	"titen/internal/storage"
 )
 
-// retainOrUpload runs when a meeting ends. Retained audio earns its keep
-// only when realtime coverage has a gap: a clean meeting deletes its local
-// chunks, a meeting that lost transcription uploads for delayed recovery.
-// Nothing is uploaded unless the user opted in and recovery is needed.
+// retainOrUpload preserves local audio and uploads only consented recovery audio.
 func (s *Service) retainOrUpload(ctx context.Context, meetingID string, needsRecovery bool) {
 	chunks, err := s.Store.AudioChunks(ctx, meetingID)
 	if err != nil || len(chunks) == 0 {
@@ -21,18 +17,15 @@ func (s *Service) retainOrUpload(ctx context.Context, meetingID string, needsRec
 	}
 	if !needsRecovery {
 		for _, chunk := range chunks {
-			_ = os.Remove(chunk.Path)
-			_ = s.Store.SetAudioChunkState(ctx, chunk.ID, "deleted")
+			_ = s.Store.SetAudioChunkState(ctx, chunk.ID, "archived")
 		}
-		_ = os.RemoveAll(filepath.Join(s.RecordingsDir, meetingID))
 		return
 	}
 	go s.uploadMeetingAudio(context.WithoutCancel(ctx), meetingID)
 }
 
 // uploadMeetingAudio registers each finished chunk, PUTs it to the
-// presigned object URL, then drops the local copy — the remote object is
-// the surviving one. Failed uploads keep the file and retry on the next
+// presigned object URL, preserving the local copy. Failed uploads keep the file and retry on the next
 // app start via ResumeAudioUploads.
 func (s *Service) uploadMeetingAudio(ctx context.Context, meetingID string) {
 	client := s.client
@@ -102,14 +95,11 @@ func (s *Service) uploadChunk(ctx context.Context, client *saas.Client, cloudMee
 	return s.completeUpload(ctx, chunk)
 }
 
-// completeUpload marks the chunk stored and drops the local file: after a
-// confirmed remote copy, keeping the duplicate would only burn the disk
-// budget. A failed upload earlier never reaches here — that copy stays.
+// completeUpload records remote success while preserving the local backup.
 func (s *Service) completeUpload(ctx context.Context, chunk storage.AudioChunk) error {
 	if err := s.Store.SetAudioChunkState(ctx, chunk.ID, "stored"); err != nil {
 		return err
 	}
-	_ = os.Remove(chunk.Path)
 	return nil
 }
 
@@ -139,5 +129,3 @@ func (s *Service) ResumeAudioUploads(ctx context.Context, client *saas.Client) {
 		}()
 	}
 }
-
-

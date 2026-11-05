@@ -9,16 +9,16 @@ import (
 	"path/filepath"
 )
 
-// ChunkRecorder writes the opt-in full-meeting recording: bounded WAV
+// Recorder writes the local full-meeting recording: bounded WAV
 // files rotated every ChunkMaxMS with a short overlap so speech is not
 // cut between files. Each finished file gets a checksum and emits a
 // ChunkMeta for the caller to persist. The temporary reconnect spool is
 // not the archive; this is.
 const (
-	ChunkMaxMS      = 60 * 60 * 1000 // 60 minutes, under Soniox's 300-minute cap
-	chunkOverlapMS  = 2_000
-	pcmBytesPerMS   = 32 // 16 kHz mono s16le
-	chunkWavHeader  = 44
+	ChunkMaxMS     = 60 * 60 * 1000 // 60 minutes, under Soniox's 300-minute cap
+	chunkOverlapMS = 2_000
+	pcmBytesPerMS  = 32 // 16 kHz mono s16le
+	chunkWavHeader = 44
 )
 
 type ChunkMeta struct {
@@ -44,9 +44,10 @@ type Recorder struct {
 	name    string
 	index   int
 	startMS int64
-	written int64 // PCM bytes in the open file
+	written int64  // PCM bytes in the open file
 	tail    []byte // trailing audio replayed at the next chunk's start
 	total   int64  // bytes on disk for this meeting
+	synced  int64
 	done    bool
 }
 
@@ -63,7 +64,7 @@ func NewRecorder(dir, meetingID string, limitBytes int64, onChunk func(ChunkMeta
 	return r, nil
 }
 
-func (r *Recorder) writeHeader() {
+func (r *Recorder) writeHeader() error {
 	var header [chunkWavHeader]byte
 	copy(header[0:], "RIFF")
 	binary.LittleEndian.PutUint32(header[4:], 36+uint32(r.written))
@@ -78,7 +79,8 @@ func (r *Recorder) writeHeader() {
 	binary.LittleEndian.PutUint16(header[34:], 16)
 	copy(header[36:], "data")
 	binary.LittleEndian.PutUint32(header[40:], uint32(r.written))
-	_, _ = r.file.WriteAt(header[:], 0)
+	_, err := r.file.WriteAt(header[:], 0)
+	return err
 }
 
 func (r *Recorder) open(startMS int64) error {
@@ -90,6 +92,7 @@ func (r *Recorder) open(startMS int64) error {
 		return err
 	}
 	r.file, r.name, r.startMS, r.written = file, path, startMS, 0
+	r.synced = 0
 	if _, err = r.file.Write(make([]byte, chunkWavHeader)); err != nil {
 		return err
 	}
@@ -102,7 +105,7 @@ func (r *Recorder) open(startMS int64) error {
 		}
 		r.written = int64(len(r.tail))
 	}
-	return nil
+	return r.writeHeader()
 }
 
 func (r *Recorder) fail(err error) {
@@ -136,6 +139,17 @@ func (r *Recorder) append(pcm []byte) {
 		return
 	}
 	r.written += int64(len(pcm))
+	if r.written-r.synced >= 16000*2 {
+		if err := r.writeHeader(); err != nil {
+			r.fail(fmt.Errorf("audio header checkpoint failed: %w", err))
+			return
+		}
+		if err := r.file.Sync(); err != nil {
+			r.fail(fmt.Errorf("audio sync failed: %w", err))
+			return
+		}
+		r.synced = r.written
+	}
 }
 
 func (r *Recorder) rotate() {
@@ -154,8 +168,12 @@ func (r *Recorder) rotate() {
 }
 
 func (r *Recorder) seal() {
-	r.writeHeader()
-	_ = r.file.Sync()
+	if err := r.writeHeader(); err != nil {
+		r.fail(err)
+	}
+	if err := r.file.Sync(); err != nil {
+		r.fail(err)
+	}
 	_ = r.file.Close()
 	data, err := os.ReadFile(r.name)
 	if err != nil {

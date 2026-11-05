@@ -844,9 +844,9 @@ func (d *desktop) recordView(c *ui.Context) {
 					components.Icon(c, lucide.Mic()).Size(13, 13).MarginStart(10)
 					components.Text(c, d.tr(c, "microphone")).FontSize(12).FontWeight(600).MarginStart(6)
 					ui.Spacer(c)
-					components.Text(c, fmt.Sprintf("%d%%", int(s.MicrophoneLevel*100+0.5))).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
+					components.Text(c, fmt.Sprintf("%d%%", int(audio.MeterLevel(s.MicrophoneLevel)*100+0.5))).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
 				})
-				ui.Meter(c, s.MicrophoneLevel, 0, 1, levels).FillWidth().Label(d.tr(c, "microphone"))
+				ui.Meter(c, audio.MeterLevel(s.MicrophoneLevel), 0, 1, levels).FillWidth().Label(d.tr(c, "microphone"))
 			})
 			ui.Column(c).Grow(1).MinWidth(220).Padding(10, 14).Gap(8).Radius(t.Radius).Border(1, t.Border).Children(func() {
 				ui.Row(c).AlignItems(ui.Center).Children(func() {
@@ -857,9 +857,9 @@ func (d *desktop) recordView(c *ui.Context) {
 					components.Icon(c, lucide.Volume2()).Size(13, 13).MarginStart(10)
 					components.Text(c, d.tr(c, "systemAudio")).FontSize(12).FontWeight(600).MarginStart(6)
 					ui.Spacer(c)
-					components.Text(c, fmt.Sprintf("%d%%", int(s.SystemLevel*100+0.5))).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
+					components.Text(c, fmt.Sprintf("%d%%", int(audio.MeterLevel(s.SystemLevel)*100+0.5))).Font("monospace").FontFeatures("tnum").FontSize(11).TextColor(t.TextMuted)
 				})
-				ui.Meter(c, s.SystemLevel, 0, 1, levels).FillWidth().Label(d.tr(c, "systemAudio"))
+				ui.Meter(c, audio.MeterLevel(s.SystemLevel), 0, 1, levels).FillWidth().Label(d.tr(c, "systemAudio"))
 			})
 		})
 	})

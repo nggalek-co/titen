@@ -50,6 +50,14 @@ func Level(s []int16) float64 {
 	return math.Sqrt(v/float64(len(s))) / 32768
 }
 
+// MeterLevel maps RMS to a -60 to 0 dBFS display range.
+func MeterLevel(rms float64) float64 {
+	if rms <= 0 {
+		return 0
+	}
+	return max(0, min(1, (20*math.Log10(rms)+60)/60))
+}
+
 // Run aligns a bounded 100ms window on the shared capture clock. Missing input
 // contributes silence so an inactive microphone never stalls system audio.
 func (Pipeline) Run(ctx context.Context, frames <-chan Frame, emit func(Chunk) error) error {
@@ -69,7 +77,7 @@ func (Pipeline) Run(ctx context.Context, frames <-chan Frame, emit func(Chunk) e
 				s[i] = q.sys[k]
 				delete(q.mic, k)
 				delete(q.sys, k)
-				mixed := int32(m[i])/2 + int32(s[i])/2
+				mixed := max(int32(-32768), min(int32(32767), int32(m[i])+int32(s[i])))
 				binary.LittleEndian.PutUint16(pcm[i*2:], uint16(int16(mixed)))
 			}
 			if err := emit(Chunk{time.Duration(cursor/SampleRate)*time.Second + time.Duration(cursor%SampleRate)*time.Second/SampleRate, pcm, Level(m), Level(s)}); err != nil {

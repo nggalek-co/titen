@@ -339,3 +339,46 @@ func TestHeartbeatSurvivesTransientFailure(t *testing.T) {
 		t.Fatalf("transient heartbeat failure surfaced as an error: %+v", snap)
 	}
 }
+
+func TestLiveAudioRemainsLocalWithoutUploadConsent(t *testing.T) {
+	s, cfg := serviceFixture(t, testhelper.CaptureConfig{Frames: serviceAudioFrames()})
+	s.RecordingsDir = t.TempDir()
+	if err := s.Start(context.Background(), cfg, "key", "backup"); err != nil {
+		t.Fatal(err)
+	}
+	id := s.Snapshot().MeetingID
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		files, _ := filepath.Glob(filepath.Join(s.RecordingsDir, id, "*.wav"))
+		if len(files) > 0 {
+			if info, err := os.Stat(files[0]); err == nil && info.Size() > 44 {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := s.Store.AudioChunks(context.Background(), id)
+	if err != nil || len(chunks) != 1 {
+		t.Fatalf("chunks=%v err=%v", chunks, err)
+	}
+	data, err := os.ReadFile(chunks[0].Path)
+	if err != nil || len(data) <= 44 || string(data[:4]) != "RIFF" {
+		t.Fatalf("missing WAV: %v", err)
+	}
+	if chunks[0].State != "archived" {
+		t.Fatal(chunks[0].State)
+	}
+	pending, err := s.Store.PendingAudioUploads(context.Background())
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("unconsented uploads: %v %v", pending, err)
+	}
+	if err := s.completeUpload(context.Background(), chunks[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(chunks[0].Path); err != nil {
+		t.Fatal("upload deleted backup", err)
+	}
+}
